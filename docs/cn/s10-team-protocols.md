@@ -17,6 +17,14 @@
 5. **掌握计划审批的实际代码路径** —— plan_approval 工具 -> lead 审批 -> 通知队友
 6. **应用协议到多个场景** —— 同一个 FSM 模式，两个不同领域
 
+**学习分层表**：
+
+| 层级 | 目标 | 检验标准 |
+|------|------|----------|
+| ⭐ 基础 | 理解自由通信的问题与协议的必要性 | 能解释 request_id 的作用，能画出 pending → approved/rejected 状态机 |
+| ⭐⭐ 进阶 | 独立实现新的请求-响应协议 | 能复用 FSM 模式添加新的跟踪器（如 vote_requests），理解 `_tracker_lock` 的保护范围 |
+| ⭐⭐⭐ 专家 | 设计多协议协同与防御性通信 | 能处理协议嵌套、超时兜底、死锁预防，能评估同名工具在 Lead/队友端的语义差异 |
+
 ---
 
 ## 0. 上手演练（建议先做）
@@ -682,6 +690,122 @@ Bob   -> Alice: shutdown_request {request_id: "bbb"}  （请求 Alice 关机）
 1. **引入优先级**：为每个 Agent 分配一个全局唯一 ID，ID 较小的一方必须先批准对方的请求（类似分布式系统中的"破坏环路等待"策略）。
 2. **超时兜底**：为每个请求设置超时时间，超时后自动 reject，打破等待链。
 3. **中心化仲裁**：所有关机请求必须经过 Lead 审批，由 Lead 决定关机顺序，从架构层面消除环形依赖的可能。
+
+---
+
+## 实战应用：设计团队通信协议
+
+### 场景一：优雅关机与交接
+
+**问题**：Lead 需要终止 Alice 的工作，但 Alice 正在写一个 2000 行的文件，中途停止会导致数据损坏。
+
+**协议流程**：
+
+```
+Lead → Alice: shutdown_request {request_id: "sd01", reason: "需求变更，暂停前端开发"}
+Alice 评估当前状态：
+  - 文件写了一半 → 调用 write_file 完成当前段落
+  - 调用 shutdown_response(request_id="sd01", approve=True, reason="已保存当前进度")
+  - should_exit = True
+Lead 收到 approved → 确认 Alice 安全退出
+```
+
+关键原则：**被请求方（Alice 的 LLM）自主决定何时真正退出**，而非立即终止。
+
+### 场景二：高风险操作审批
+
+**问题**：Bob 要执行数据库迁移，一旦出错会影响所有服务。
+
+**协议流程**：
+
+```
+Bob → Lead: plan_approval {
+    plan: "1. 备份 production 数据库
+           2. 在 staging 执行迁移脚本
+           3. 运行回归测试
+           4. 确认无误后迁移 production"
+}
+Lead 审查 → plan_approval(request_id="pl01", approve=True, feedback="增加步骤：staging 数据校验")
+Bob 收到批准 → 按审批后的计划执行
+```
+
+关键原则：**执行者先承诺计划，管理者审查后才放行**，避免"先斩后奏"。
+
+### 场景三：资源竞争仲裁
+
+**问题**：Alice 和 Bob 都需要独占访问测试数据库，同时操作会互相干扰。
+
+通过 Lead 作为仲裁中心协调：
+
+```
+Alice → Lead: plan_approval {plan: "需要独占测试数据库 30 分钟运行迁移测试"}
+Lead 检查当前状态 → Bob 未在使用 → 批准
+Lead → Bob: broadcast {content: "测试数据库已被 Alice 占用至 14:30"}
+Bob 收到广播 → 推迟自己的数据库操作
+```
+
+### 协议设计模板
+
+以下代码骨架可直接复用于任何新的请求-响应协议：
+
+```python
+# ===== 第一步：定义全局跟踪器和锁 =====
+my_requests = {}                       # {request_id: {"status": "pending", ...}}
+_my_lock = threading.Lock()            # 线程安全保护
+
+# ===== 第二步：定义工具 Schema（请求方） =====
+{
+    "name": "my_request",
+    "description": "发起 XXX 请求",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "target": {"type": "string"},
+            "payload": {"type": "string"}
+        },
+        "required": ["target"]
+    }
+}
+
+# ===== 第三步：定义工具 Schema（响应方） =====
+{
+    "name": "my_response",
+    "description": "响应 XXX 请求",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "request_id": {"type": "string"},
+            "approve": {"type": "boolean"},
+            "reason": {"type": "string"}
+        },
+        "required": ["request_id", "approve"]
+    }
+}
+
+# ===== 第四步：请求处理器 =====
+def handle_my_request(target: str, payload: str = "") -> str:
+    req_id = str(uuid.uuid4())[:8]
+    with _my_lock:
+        my_requests[req_id] = {
+            "target": target,
+            "payload": payload,
+            "status": "pending",
+            "created_at": time.time()
+        }
+    BUS.send("lead", target, payload, "my_request", {"request_id": req_id})
+    return f"Request {req_id} sent to '{target}' (pending)"
+
+# ===== 第五步：响应处理器 =====
+def handle_my_response(request_id: str, approve: bool, reason: str = "") -> str:
+    with _my_lock:
+        req = my_requests.get(request_id)
+        if not req:
+            return f"Error: Unknown request {request_id}"
+        req["status"] = "approved" if approve else "rejected"
+    BUS.send(req["target"], "lead", reason, "my_response",
+             {"request_id": request_id, "approve": approve})
+    return f"Request {request_id} {'approved' if approve else 'rejected'}"
+```
 
 ---
 

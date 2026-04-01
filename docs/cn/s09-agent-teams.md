@@ -15,6 +15,14 @@
 3. **实现 TeammateManager** —— 队友生命周期管理（spawn → work → idle → shutdown）
 4. **理解 JSONL 邮箱** —— 持久化的、append-only 的消息传递
 
+**学习分层表**：
+
+| 层级 | 目标 | 检验标准 |
+|------|------|----------|
+| ⭐ 基础 | 理解团队 vs 子 Agent 的区别 | 能说出持久化队友的三个特点（独立上下文、双向通信、状态管理） |
+| ⭐⭐ 进阶 | 独立搭建多人协作团队 | 能完成 spawn → send → drain 闭环，理解 JSONL 邮箱的 drain 语义与 append 原子性 |
+| ⭐⭐⭐ 专家 | 设计角色分工与通信协议 | 能为具体项目定义角色模板，设计通信拓扑，评估 spawn 权限隔离的必要性 |
+
 ---
 
 ## 0. 上手演练（建议先做）
@@ -480,6 +488,87 @@ Lead                        Alice                      Bob
 ### Q4：如何处理消息丢失？
 
 JSONL 的 append 操作是原子的，不容易丢失。但如果需要更高可靠性，可以实现确认机制（s10 会引入结构化的请求-响应协议）。
+
+---
+
+## 实战应用：为你的项目设计 Agent 团队
+
+### 场景一：Web 开发团队
+
+```
+Lead (协调者)
+ ├─ Alice (前端开发)
+ │   role: frontend
+ │   prompt: "你负责 React 组件开发和页面交互。
+ │            收到设计稿后先实现静态页面，再接入 API。"
+ │   通信：接收 Lead 的任务分配，完成后通过 send_message 回报
+ │
+ ├─ Bob (后端开发)
+ │   role: backend
+ │   prompt: "你负责 API 端点和数据库设计。
+ │            先完成 API 契约，再实现业务逻辑。"
+ │   通信：接收需求 → 设计 API → 回报契约 → 实现 → 通知 Alice 接口就绪
+ │
+ └─ Carol (测试)
+     role: tester
+     prompt: "你负责编写和执行测试。
+              收到功能完成通知后，先写测试用例再执行。"
+     通信：监听 Alice/Bob 的完成消息 → 自动编写测试 → 汇报结果
+```
+
+通信拓扑：Lead 分配任务给 Alice 和 Bob；Bob 完成后通知 Alice（接口就绪）；Alice 和 Bob 都完成后通知 Carol。
+
+### 场景二：数据 ETL 流水线
+
+```
+Lead → Collector (采集 Agent)
+          ↓ send_message("原始数据已就绪")
+       Cleaner (清洗 Agent)
+          ↓ send_message("清洗完成，已入库")
+       Analyst (分析 Agent)
+          ↓ send_message("分析报告已生成")
+       Reporter (报告 Agent)
+```
+
+这是一个链式管道：每个 Agent 完成阶段工作后通知下游。角色定义示例：
+
+```python
+spawn_teammate(name="collector", role="data-collector",
+    prompt="从 CSV/API/DB 采集原始数据，存入 .data/raw/ 目录。完成后通知 cleaner。")
+
+spawn_teammate(name="cleaner", role="data-cleaner",
+    prompt="清洗 .data/raw/ 中的数据：去重、填充缺失值、格式标准化。完成后通知 analyst。")
+```
+
+### 场景三：安全审计团队
+
+```
+Lead (安全负责人)
+ ├─ Scanner (漏洞扫描)
+ │   prompt: "运行 OWASP ZAP 和 npm audit，输出漏洞清单"
+ │
+ ├─ PenTester (渗透测试)
+ │   prompt: "根据扫描结果执行手动渗透测试，记录攻击路径"
+ │
+ ├─ Reporter (报告编写)
+ │   prompt: "汇总扫描和渗透结果，生成风险评级报告"
+ │
+ └─ Verifier (修复验证)
+     prompt: "收到修复完成通知后，重新测试确认漏洞已修复"
+```
+
+通信设计：Scanner 完成 → Lead 分发给 PenTester；PenTester 和 Scanner 结果汇总给 Reporter；开发修复后 Lead 通知 Verifier 复测。
+
+### "从子 Agent 升级到团队"决策矩阵
+
+| 评估维度 | 用子 Agent (s04) | 用团队 (s09) |
+|----------|------------------|--------------|
+| 任务持续性 | 一次性分析、单次转换 | 长期项目、需要多轮协作 |
+| 上下文需求 | 无需记忆，每次独立 | 需要累积经验（如代码风格偏好） |
+| 通信模式 | 父→子单向即可 | 需要双向沟通或队友间直接通信 |
+| 并发数量 | 1-2 个临时子任务 | 3+ 个角色持续运行 |
+| 状态管理 | 不需要跟踪状态 | 需要知道谁在做什么（working/idle） |
+| 故障恢复 | 不需要，重做即可 | 需要从 JSONL 邮箱和 config.json 恢复 |
 
 ---
 

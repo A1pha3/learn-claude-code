@@ -16,6 +16,14 @@
 4. **理解身份重注入** —— 压缩后在 messages 列表头部插入 identity block
 5. **掌握模块级请求跟踪器** —— `shutdown_requests` / `plan_requests` 字典 + `_tracker_lock`
 
+**学习分层表**：
+
+| 层级 | 目标 | 检验标准 |
+|------|------|----------|
+| ⭐ 基础 | 理解自主性设计的动机 | 能解释 WORK/IDLE 循环的三个阶段及触发条件，理解 60 秒超时的意义 |
+| ⭐⭐ 进阶 | 独立配置自主团队完成实际任务 | 能设计合理的任务板（`scan_unclaimed_tasks` 三重过滤），理解 `_claim_lock` 竞态防护 |
+| ⭐⭐⭐ 专家 | 优化自主行为策略与身份管理 | 能实现角色偏好过滤、动态超时、认领冲突检测，能评估身份重注入的启发式阈值 |
+
 ---
 
 ## 0. 上手演练（建议先做）
@@ -556,6 +564,86 @@ def claim_task(task_id: int, owner: str) -> str:
 1. 用 `/team` 查看队友状态，如果是 `shutdown` 则需要重新 spawn。
 2. 用 `/tasks` 确认任务确实处于 pending 且无 owner。
 3. 检查 `.tasks/` 目录下对应的 `task_*.json` 文件内容，确认 status 和 owner 字段。
+
+---
+
+## 实战应用：构建自主工作团队
+
+### 场景一：看板驱动开发（自动认领 Jira/GitHub Issues）
+
+将外部 Issue 转换为 `.tasks/` 中的任务文件，自主团队自动认领：
+
+```
+Lead 工作流：
+  1. 从 GitHub Issues 拉取待办事项
+  2. 为每个 Issue 创建 task_*.json：
+     {
+       "id": 1,
+       "subject": "Fix: 登录页面在 Safari 下布局错乱",
+       "description": "Issue #42: Safari 下 flexbox 兼容性问题",
+       "status": "pending",
+       "owner": "",
+       "required_role": "frontend"    ← 扩展字段，可让 scan 函数做角色过滤
+     }
+  3. spawn 队友，团队自动运转
+
+Alice (前端) 的 IDLE 轮询：
+  → 扫描任务板 → 发现 task_1 (pending, required_role=frontend)
+  → claim_task(id=1, owner="alice")
+  → WORK: 修复 Safari 布局 → 提交 → idle()
+  → IDLE: 继续扫描...
+```
+
+### 场景二：运维自愈系统（故障检测 → 诊断 → 修复 → 验证）
+
+```
+Lead (运维负责人)
+ ├─ Watchdog (监控 Agent)
+ │   prompt: "每 30 秒检查服务健康状态，发现异常立即创建诊断任务"
+ │   行为：IDLE 轮询中通过 bash 执行健康检查 → 发现故障 → 创建任务
+ │
+ ├─ Doctor (诊断 Agent)
+ │   prompt: "认领诊断任务，分析日志，输出根因报告"
+ │   行为：扫描到诊断类任务 → 认领 → 查日志 → 输出根因 → 创建修复任务
+ │
+ └─ Medic (修复 Agent)
+     prompt: "认领修复任务，执行预定义修复方案，修复后触发验证"
+     行为：扫描到修复类任务 → 认领 → 执行修复 → 创建验证任务
+
+自愈闭环：
+  Watchdog 检测故障 → Doctor 诊断 → Medic 修复 → Watchdog 再次验证
+  全程无需人工介入
+```
+
+### 场景三：内容生产流水线
+
+```
+Lead 创建任务：
+  task_1: "撰写 AI Agent 技术趋势报告" (status: pending)
+  task_2: "制作配套图表" (status: pending, blockedBy: [1])
+  task_3: "排版与校对" (status: pending, blockedBy: [1, 2])
+
+自主团队：
+  Writer (IDLE → 扫描 → 认领 task_1 → WORK → 完成 → idle)
+  Designer (IDLE → 扫描 → task_2 被 blockedBy 跳过 → 继续等待)
+  → task_1 完成，_clear_dependency 解锁 task_2
+  Designer (IDLE → 扫描 → 认领 task_2 → WORK → 完成 → idle)
+  → task_2 完成，_clear_dependency 解锁 task_3
+  Editor (IDLE → 扫描 → 认领 task_3 → WORK → 完成)
+```
+
+### "被动 vs 自主"升级决策表
+
+| 评估维度 | 被动模式 (s10) | 自主模式 (s11) |
+|----------|----------------|----------------|
+| 任务来源 | Lead 逐一分配 | 队友扫描任务板自动认领 |
+| Lead 负担 | 高（每步都需要手动调度） | 低（只管创建任务） |
+| 适用规模 | 3 个以内队友、5 个以内任务 | 3+ 队友、10+ 任务 |
+| 响应速度 | 依赖 Lead 的调度频率 | 5 秒轮询，几乎实时 |
+| 资源管理 | 队友持续占用线程 | 60 秒无工作自动释放 |
+| 一致性要求 | Lead 控制分配，无竞态 | 需要 `_claim_lock` 防竞态 |
+| 错误恢复 | Lead 重新分配即可 | 需要处理认领冲突和僵尸任务 |
+| 升级成本 | 低 | 需要设计合理的任务板和角色过滤 |
 
 ---
 

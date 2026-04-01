@@ -16,6 +16,14 @@
 4. **分析 threading.Lock 的使用** —— 保护共享状态的具体范围
 5. **理解超时保护** —— `timeout=300` 的实际值与子进程超时机制
 
+**学习分层表**：
+
+| 层级 | 目标 | 检验标准 |
+|------|------|----------|
+| ⭐ 基础 | 理解阻塞 vs 后台执行的区别 | 能画出同步与异步执行的时间线对比图，解释 drain 模式语义 |
+| ⭐⭐ 进阶 | 独立集成 BackgroundManager 到 Agent 循环 | 能正确实现通知注入的 user/assistant 配对，理解 `_lock` 的保护范围 |
+| ⭐⭐⭐ 专家 | 设计并发安全策略与生产级防护 | 能实现并发限制（Semaphore）、任务取消（Popen.terminate）、与 s07 任务系统的联动集成 |
+
 ---
 
 ## 0. 上手演练（建议先做）
@@ -695,6 +703,65 @@ class BackgroundManager:
 1. 不阻塞主循环，等待时间长一些可以接受
 2. 适合的操作（构建、安装、测试）本身就可能需要几分钟
 3. 300 秒 = 5 分钟是一个合理的上限，避免失控进程
+
+---
+
+## 实战应用：让 Agent 不再被慢操作阻塞
+
+### 场景一：CI/CD 流水线（构建 + 测试 + 部署并行）
+
+```
+用户：跑一遍完整流水线
+
+Agent 调用序列：
+  1. background_run("docker build -t myapp:latest .")
+     → 立即返回 task_id，后台构建镜像
+
+  2. background_run("npm run lint")
+     → 立即返回 task_id，后台运行 lint
+
+  3. write_file("deploy-notes.md", "构建中...")   ← 主线程不空闲，同步写文件
+
+  4. 下轮 drain 时收到构建和 lint 结果
+     → 构建成功且 lint 通过，继续部署流程
+```
+
+构建、lint、文件写入三件事并行。Agent 的响应能力不受构建耗时影响。
+
+### 场景二：批量数据处理
+
+需要依次处理 3 个 CSV 文件（清洗 + 聚合 + 导出），但各文件的处理互不依赖：
+
+```python
+# 三个后台任务并行启动
+background_run("python process.py data/region_a.csv")
+background_run("python process.py data/region_b.csv")
+background_run("python process.py data/region_c.csv")
+
+# Agent 在等待期间可以处理用户的其他请求
+# 全部完成后，汇总三份结果
+```
+
+### 场景三：实时监控 + 告警
+
+```python
+# 后台持续运行健康检查脚本
+background_run("watch -n 10 'curl -s http://api/health | jq .status'")
+
+# Agent 同时继续与用户交互
+# 健康检查异常时，drain 注入告警信息，Agent 立即响应
+```
+
+### 后台 vs 同步决策矩阵
+
+| 命令特征 | 建议方式 | 典型示例 |
+|----------|----------|----------|
+| 耗时 > 5 秒且结果不立即需要 | `background_run` | `pip install`、`pytest`、`docker build` |
+| 耗时 < 1 秒 | 同步 `bash` | `git status`、`ls`、`cat` |
+| 后续操作依赖其输出 | 同步 `bash` | `git rev-parse HEAD`、`python -c "print(config)"` |
+| 需要交互式输入 | 同步 `bash` | 不推荐长交互命令，改用参数化方式 |
+| 多个独立的长操作 | `background_run` x N | 并行构建多个模块 |
+| 可能超过 300 秒 | 拆分后 `background_run` | 大数据集处理应拆分为批次 |
 
 ---
 

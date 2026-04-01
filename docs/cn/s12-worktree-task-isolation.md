@@ -15,6 +15,14 @@
 3. **实现任务-工作树绑定** —— 任务（控制面）与工作树（执行面）的关联
 4. **设计事件流** —— 通过 append-only 日志追踪完整生命周期
 
+**学习分层表**：
+
+| 层级 | 目标 | 检验标准 |
+|------|------|----------|
+| ⭐ 基础 | 理解隔离的必要性与 Worktree 概念 | 能解释共享目录冲突的根因，能描述 worktree create → run → remove 的基本流程 |
+| ⭐⭐ 进阶 | 独立实现任务-工作树绑定工作流 | 能完成完整闭环：创建任务 → 创建工作树绑定 → 隔离执行 → remove/keep，理解 EventBus 的审计价值 |
+| ⭐⭐⭐ 专家 | 设计并行执行与事件查询系统 | 能实现 `run_parallel` 多工作树并行执行、事件按类型/时间范围过滤，能评估非 Git 环境的降级方案 |
+
 ---
 
 ## 0. 上手演练（建议先做）
@@ -666,6 +674,100 @@ def status(self, name: str) -> str:
 - 优先使用参数数组方式调用命令
 - 对可执行命令建立白名单
 - 记录命令执行事件，便于审计
+
+---
+
+## 实战应用：为并行开发构建隔离环境
+
+### 场景一：微服务并行开发
+
+多个队友同时开发不同的微服务，各自拥有独立的代码分支和文件系统：
+
+```
+Lead:
+  task_create(subject="用户服务开发")
+  task_create(subject="订单服务开发")
+  task_create(subject="支付服务开发")
+
+  worktree_create(name="user-svc", task_id=1)
+  worktree_create(name="order-svc", task_id=2)
+  worktree_create(name="payment-svc", task_id=3)
+
+Alice (认领任务 #1):
+  worktree_run(name="user-svc", command="vim services/user.py")
+  worktree_run(name="user-svc", command="git add -A && git commit -m 'feat: 用户服务'")
+
+Bob (认领任务 #2):
+  worktree_run(name="order-svc", command="vim services/order.py")
+  # Bob 的修改完全不影响 Alice 的文件系统视图
+
+三人完成后：
+  worktree_keep(name="user-svc")     # 保留供 code review
+  worktree_remove(name="order-svc", complete_task=true)   # 直接合并并移除
+  worktree_remove(name="payment-svc", complete_task=true)
+```
+
+### 场景二：A/B 测试隔离
+
+对比两种实现方案，在隔离环境中分别运行基准测试：
+
+```
+Lead:
+  task_create(subject="A/B 测试：数组排序算法")
+  task_create(subject="A 方案：快速排序")
+  task_create(subject="B 方案：归并排序")
+
+  worktree_create(name="sort-quick", task_id=2, base_ref="HEAD")
+  worktree_create(name="sort-merge", task_id=3, base_ref="HEAD")
+
+# 在两个隔离环境中分别实现和测试
+worktree_run(name="sort-quick", command="python -c 'from sort import quicksort; ...'")
+worktree_run(name="sort-merge", command="python -c 'from sort import mergesort; ...'")
+
+# 对比结果，选择更优方案保留，移除另一个
+worktree_keep(name="sort-quick")       # 胜出方案保留
+worktree_remove(name="sort-merge", force=true)  # 落选方案清理
+```
+
+### 场景三：CI 并行测试执行
+
+将测试套件拆分到多个工作树中并行执行，缩短总耗时：
+
+```
+Lead:
+  worktree_create(name="test-unit")
+  worktree_create(name="test-integration")
+  worktree_create(name="test-e2e")
+
+  # 三个工作树并行运行不同类型的测试
+  worktree_run(name="test-unit", command="pytest tests/unit/ -v")
+  worktree_run(name="test-integration", command="pytest tests/integration/ -v")
+  worktree_run(name="test-e2e", command="pytest tests/e2e/ -v")
+
+  # 收集结果后清理
+  worktree_remove(name="test-unit", force=true)
+  worktree_remove(name="test-integration", force=true)
+  worktree_remove(name="test-e2e", force=true)
+```
+
+### "从共享目录到工作树"迁移指南
+
+| 当前状态 | 何时需要升级到工作树 | 迁移步骤 |
+|----------|----------------------|----------|
+| 1 个队友，串行任务 | 不需要 | 继续使用共享目录即可 |
+| 2-3 个队友，修改不同文件 | 可以暂缓 | 约定文件所有权（owner 字段）即可 |
+| 2+ 个队友，可能修改同一文件 | **应该升级** | 为每个并行任务创建独立 worktree |
+| 需要 A/B 对比实验 | **应该升级** | 两个 worktree 基于同一起点，分别修改 |
+| CI 并行测试套件 | **建议升级** | 每个测试分片一个 worktree，避免状态干扰 |
+| 需要完整审计链 | **必须升级** | EventBus 的 append-only 事件流提供完整可观测性 |
+
+迁移操作清单：
+
+1. 确认项目在 Git 仓库中（`git rev-parse --show-toplevel` 成功）
+2. 将现有任务系统的 `.tasks/` 目录路径从 `WORKDIR` 改为 `REPO_ROOT`
+3. 在队友的 `claim_task` 成功后，自动调用 `worktree_create` 创建绑定的工作树
+4. 将队友的 `bash` 工具替换为 `worktree_run`，确保命令在隔离目录中执行
+5. 任务完成时调用 `worktree_remove(complete_task=true)` 清理环境
 
 ---
 

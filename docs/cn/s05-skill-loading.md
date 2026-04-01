@@ -15,6 +15,14 @@
 3. **实现按需加载** —— 通过 load_skill 工具在需要时注入详细知识
 4. **量化 Token 收益** —— 计算两层注入相比全量注入的 Token 节省
 
+### 学习分层指南
+
+| 层级 | 掌握标准 | 对应内容 | 建议用时 |
+|------|----------|----------|----------|
+| L1 基础 | 能区分 Layer 1 与 Layer 2 的职责，能新增 SKILL.md 并验证自动发现 | 1.问题的本质、2.两层注入模式、3.技能文件结构 | 30 分钟 |
+| L2 进阶 | 能独立实现 SkillLoader 的 frontmatter 解析，能说明按需加载在 Token 成本上的收益 | 4.SkillLoader 源码分析、5.系统提示的组装、7.完整的工作流程 | 45 分钟 |
+| L3 专家 | 能设计技能依赖、参数化技能等高级特性，能构建三层加载体系（元数据->正文->辅助资源） | 8.高级特性、11.最佳实践、14.练习 | 60 分钟 |
+
 ---
 
 ## 0. 上手演练（建议先做）
@@ -718,6 +726,177 @@ description: |
 # 应该写成单行：
 description: 简洁的单行描述，包含触发条件
 ```
+
+---
+
+## 实战应用：为你的 Agent 构建知识库
+
+前面的章节从原理层面解释了 SkillLoader 的两层注入设计和实现。下面通过三个真实场景，帮助你为 Agent 构建实用的知识库。
+
+### 场景 1：公司内部编码规范
+
+```
+需求：让 Agent 遵循公司的编码规范（命名、架构、Git 流程）
+
+不用技能系统：
+  所有规范硬编码在 system prompt 中
+  每次调用消耗 ~3000 tokens（即使大部分对话不涉及编码规范）
+
+使用技能系统：
+  skills/coding-standards/SKILL.md：
+    Layer 1（常驻）：~25 tokens
+      - coding-standards: Company coding standards including naming,
+        architecture patterns, and Git workflow.
+
+    Layer 2（按需）：~2500 tokens
+      包含：命名规范、架构分层规则、Git 分支策略、PR 模板
+
+  效果：
+  - 用户闲聊时：不加载技能，只消耗 25 tokens
+  - 用户写代码时：自动加载，消耗 2525 tokens
+  - 与全量注入相比：日常对话节省 98.3% 的规范相关 token
+
+适合时机：当规范文档 > 1000 tokens，且不是每次对话都需要
+```
+
+### 场景 2：API 文档查询助手
+
+```
+需求：让 Agent 能正确使用公司内部 REST API
+
+skills/api-guide/SKILL.md：
+  Layer 1：~30 tokens
+    - api-guide: Internal REST API reference including endpoints,
+      authentication, error codes, and rate limits.
+
+  Layer 2（完整内容）：
+    ## Authentication
+    - Bearer Token 认证方式
+    - Token 刷新机制
+
+    ## Endpoints
+    - GET /users -- 用户列表查询
+    - POST /users -- 创建用户
+    - PUT /users/:id -- 更新用户
+    - DELETE /users/:id -- 删除用户
+
+    ## Error Codes
+    - 4001: 参数校验失败
+    - 4003: 权限不足
+    - 5000: 内部服务错误
+
+    ## Rate Limits
+    - 每分钟 60 次请求
+    - 超限返回 429 状态码
+
+效果：Agent 在涉及 API 调用时自动加载完整文档，
+其他时候不消耗 API 文档的 token
+
+适合时机：API 文档 > 1500 tokens，包含错误码、鉴权等细节
+```
+
+### 场景 3：安全合规检查清单
+
+```
+需求：让 Agent 在代码审查时自动检查安全合规性
+
+skills/security-checklist/SKILL.md：
+  Layer 1：~30 tokens
+    - security-checklist: OWASP Top 10 security audit checklist.
+      Use when reviewing code, checking for vulnerabilities, or
+      performing security audits.
+
+  Layer 2（完整内容，约 2000 tokens）：
+    ## OWASP Top 10 Checklist
+
+    ### A01 - Broken Access Control
+    - [ ] 检查所有 API 端点的权限校验
+    - [ ] 验证垂直和水平访问控制
+    ...
+
+    ### A02 - Cryptographic Failures
+    - [ ] 敏感数据是否加密存储
+    - [ ] 传输层是否使用 TLS
+    ...
+
+    ### A03 - Injection
+    - [ ] SQL 参数化查询
+    - [ ] XSS 防护
+    - [ ] 命令注入防护
+    ...
+
+    ## Audit Rules
+    - 所有密码必须使用 bcrypt/argon2 哈希
+    - JWT 过期时间不超过 1 小时
+    - 日志中不得包含敏感信息
+
+效果：日常编码不触发，代码审查时自动加载安全检查清单
+
+适合时机：安全规范条目 > 500 tokens，按需使用的检查场景
+```
+
+### SKILL.md 编写模板
+
+以下是一个可直接复制使用的 SKILL.md 模板，适配当前 SkillLoader 的 frontmatter 解析能力：
+
+```markdown
+---
+name: your-skill-name
+description: One-line description with trigger conditions. Use when user asks to do X, check Y, or work with Z.
+tags: keyword1, keyword2, keyword3
+---
+
+# Your Skill Title
+
+You now have expertise in [specific domain].
+
+## Quick Reference
+
+[3-5 sentences summarizing the core knowledge]
+
+## Rules
+
+1. [Rule 1]
+2. [Rule 2]
+3. [Rule 3]
+
+## Steps
+
+### Step 1: [Action]
+[Detailed instructions]
+
+### Step 2: [Action]
+[Detailed instructions]
+
+### Step 3: [Action]
+[Detailed instructions]
+
+## Examples
+
+### Example 1: [Scenario]
+[Input/Output example with explanation]
+
+## Common Mistakes
+
+- [Mistake 1]: [Why it's wrong and how to fix]
+- [Mistake 2]: [Why it's wrong and how to fix]
+
+## Checklist
+
+- [ ] [Item 1]
+- [ ] [Item 2]
+- [ ] [Item 3]
+```
+
+**编写要点**：
+
+| 要素 | 说明 | 注意事项 |
+|------|------|----------|
+| `name` | 技能的唯一标识，用于 `load_skill(name=...)` 调用 | 只能使用小写字母、数字、连字符 |
+| `description` | 必须写成单行，包含 "Use when..." 触发条件 | 不要使用 `\|` 多行语法，当前解析器不支持 |
+| `tags` | 逗号分隔的关键词，追加在描述后辅助匹配 | 可选字段 |
+| 正文结构 | Quick Reference -> Rules -> Steps -> Examples -> Checklist | 根据技能类型调整，不是所有技能都需要全部模块 |
+| Token 控制 | Layer 2 正文建议控制在 1500-2500 tokens | 过短不值得按需加载，过长消耗过多上下文 |
 
 ---
 
