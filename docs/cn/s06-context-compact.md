@@ -1,8 +1,8 @@
 # s06：上下文压缩 —— 实现无限会话
 
-> **核心口号**：*"上下文会填满，需要腾出空间"*
+> **核心口号**：*"上下文会填满，需要战略性地遗忘"*
 
-> **学习目标**：理解上下文窗口的限制，掌握三层压缩策略，学会实现可持续的长对话
+> **学习目标**：理解上下文窗口的限制，掌握三层压缩策略的精确实现，学会设计可持续的长对话机制
 
 ---
 
@@ -11,9 +11,10 @@
 完成本章后，你将能够：
 
 1. **理解上下文饱和问题** —— 为什么长对话会"变笨"
-2. **掌握三层压缩策略** —— 微压缩、自动压缩、手动压缩
-3. **实现转录存档** —— 保存完整历史到磁盘
-4. **设计压缩触发机制** —— 何时触发自动压缩
+2. **掌握三层压缩策略** —— 微压缩、自动压缩、手动压缩的精确实现
+3. **理解 Token 估算机制** —— 字符数/4 的简化估算及其精度局限
+4. **实现转录存档** —— JSONL 格式的完整历史保存与恢复
+5. **掌握触发机制** —— KEEP_RECENT 和 THRESHOLD 参数的调优
 
 ---
 
@@ -27,15 +28,16 @@ uv run python agents/s06_context_compact.py
 
 建议观察：
 
-1. 微压缩在每轮结束后如何处理旧工具结果。
-2. 自动压缩在什么阈值触发，以及触发后的上下文变化。
-3. 转录存档如何保证“压缩后仍可追溯完整历史”。
+1. 微压缩在每轮结束后如何处理旧工具结果（观察 `[Previous: used {tool_name}]` 日志）。
+2. 自动压缩在什么 Token 阈值触发，以及触发后的上下文变化。
+3. `.transcripts/` 目录中的 JSONL 文件如何记录完整历史。
 
 ### 本章完成标准
 
 - 能判断三层压缩分别解决哪一类上下文问题。
-- 能根据会话长度给出合理阈值与摘要策略。
-- 能解释“压缩”和“可追溯”为什么必须同时成立。
+- 能根据会话长度给出合理的 KEEP_RECENT 和 THRESHOLD 参数。
+- 能解释"压缩"和"可追溯"为什么必须同时成立。
+- 能对照源码说明微压缩中 tool_name 映射的精确实现。
 
 ---
 
@@ -66,10 +68,10 @@ uv run python agents/s06_context_compact.py
 轮次 5（1500 tokens）：
   Agent：测试通过！
 
-总计：~12,000 tokens
+总计：~12,000 tokens（仅 5 轮）
 ```
 
-**问题**：对话越长，上下文越大，最终可能超出窗口限制（200,000 tokens）。
+**问题**：对话越长，上下文越大，最终可能超出窗口限制（200,000 tokens）。在复杂编程任务中，50-100 轮对话很常见，Token 消耗可能轻松超过 100,000。
 
 ### 1.2 饱和的后果
 
@@ -80,8 +82,8 @@ uv run python agents/s06_context_compact.py
 │ 系统提示（1,000 tokens）████        │
 │ 用户问题（500 tokens）██            │
 │ 工具调用 1（100 tokens）             │
-│ 工具结果 1（4,000 tokens）██████████│
-│ 工具调用 2（100 tokens）             │
+│ 工具结果 1（4,000 tokens）██████████│  ← 这些旧结果已经没用了
+│ 工具调用 2（100 tokens）             │     但仍然占据上下文空间
 │ 工具结果 2（3,000 tokens）████████  │
 │ ... 40 轮对话后 ...                 │
 │                                     │
@@ -94,298 +96,348 @@ uv run python agents/s06_context_compact.py
 **后果**：
 1. 系统提示被遗忘 → Agent 偏离原始角色
 2. 用户问题被淹没 → Agent 忘记最终目标
-3. Token 预算耗尽 → 无法继续对话
+3. Token 预算耗尽 → 无法继续对话（API 报错）
+4. API 费用线性增长 → 每次调用都发送全部历史
 
 ### 1.3 解决方案：三层压缩
 
 ```
-策略 1：微压缩（每轮执行）
+Layer 1：微压缩 micro_compact（每轮执行，零成本）
   用占位符替换旧的工具结果
-  "读取了 auth.py" ← [Previous: used read_file]
+  "[Previous: used read_file]" ← 原来 4000 tokens 的文件内容
 
-策略 2：自动压缩（触发时执行）
-  保存完整记录到磁盘
-  用摘要替换整个对话历史
+Layer 2：自动压缩 auto_compact（阈值触发）
+  Token 估算超过 50000 时触发
+  保存完整记录到 .transcripts/ 目录
+  用 LLM 生成的摘要替换整个对话历史
 
-策略 3：手动压缩（Agent 主动调用）
+Layer 3：手动压缩 compact 工具（Agent 主动调用）
   Agent 决定现在需要压缩
-  调用 compact 工具
+  调用 compact 工具 → 触发与自动压缩相同的逻辑
 ```
 
 ---
 
-## 2. 微压缩（Micro-compact）
+## 2. 微压缩（Micro-compact）—— Layer 1
 
-### 2.1 思想
+### 2.1 核心思想
 
-旧的工具结果不再有用，用占位符替换它们：
+工具调用的结果（如文件内容、命令输出）在后续轮次中通常不再需要。微压缩在每轮 LLM 调用前，将旧的工具结果替换为简短的占位符。
 
-```python
-# 压缩前：
-{
-    "type": "tool_result",
-    "tool_use_id": "tool_123",
-    "content": "def authenticate(user, password):\n    # 4000 lines of code\n..."
-}
-
-# 压缩后：
-{
-    "type": "tool_result",
-    "tool_use_id": "tool_123",
-    "content": "[Previous: used read_file on auth.py]"
-}
-```
-
-### 2.2 实现
+### 2.2 源码实现分析
 
 ```python
-KEEP_RECENT = 5  # 保留最近 5 个工具结果
+KEEP_RECENT = 3  # 保留最近 3 个工具结果不压缩
 
 def micro_compact(messages: list) -> list:
-    """每轮都执行的微压缩"""
+    # 步骤 1：收集所有 tool_result 的位置信息
     tool_results = []
-
-    # 收集所有工具结果的位置
-    for i, msg in enumerate(messages):
+    for msg_idx, msg in enumerate(messages):
         if msg["role"] == "user" and isinstance(msg.get("content"), list):
-            for j, part in enumerate(msg["content"]):
+            for part_idx, part in enumerate(msg["content"]):
                 if isinstance(part, dict) and part.get("type") == "tool_result":
-                    tool_results.append((i, j, part))
+                    tool_results.append((msg_idx, part_idx, part))
 
-    # 如果工具结果不多，不需要压缩
+    # 步骤 2：如果工具结果不超过 KEEP_RECENT，不需要压缩
     if len(tool_results) <= KEEP_RECENT:
         return messages
 
-    # 压缩旧的工具结果（保留最近的几个）
-    for i, j, part in tool_results[:-KEEP_RECENT]:
-        content = part.get("content", "")
-        # 只压缩长内容
-        if len(content) > 100:
-            # 尝试提取工具名
-            tool_name = part.get("tool_use_id", "unknown")
-            part["content"] = f"[Previous: tool result from {tool_name}]"
+    # 步骤 3：构建 tool_use_id → tool_name 的映射表
+    #         遍历所有 assistant 消息中的 tool_use block
+    tool_name_map = {}
+    for msg in messages:
+        if msg["role"] == "assistant":
+            content = msg.get("content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if hasattr(block, "type") and block.type == "tool_use":
+                        tool_name_map[block.id] = block.name
+
+    # 步骤 4：压缩旧的（超出 KEEP_RECENT 的）工具结果
+    to_clear = tool_results[:-KEEP_RECENT]  # 保留最后 3 个
+    for _, _, result in to_clear:
+        if isinstance(result.get("content"), str) and len(result["content"]) > 100:
+            tool_id = result.get("tool_use_id", "")
+            tool_name = tool_name_map.get(tool_id, "unknown")
+            result["content"] = f"[Previous: used {tool_name}]"
 
     return messages
 ```
 
-### 2.3 集成到循环中
+### 2.3 关键实现细节
 
-```python
-def agent_loop(query):
-    messages = [{"role": "user", "content": query}]
+**1. 双层索引定位**：`tool_results` 存储 `(msg_idx, part_idx, part)` 三元组。这是因为 `tool_result` 嵌套在 `user` 消息的 `content` 列表中（Anthropic API 规范：tool_result 必须作为 user 消息的一部分发送）。
 
-    while True:
-        # ========== 每轮都执行微压缩 ==========
-        messages = micro_compact(messages)
+**2. tool_name 映射**：微压缩不是简单地写 "tool result"，而是通过匹配 `tool_use_id` 找到对应的工具名，生成更有信息量的占位符：
 
-        response = client.messages.create(
-            model=MODEL,
-            messages=messages,
-            tools=TOOLS,
-            max_tokens=8000,
-        )
-        # ... 其余逻辑
+```
+[Previous: used read_file]     ← 比 [Previous: tool result] 更有用
+[Previous: used bash]          ← LLM 能理解这是旧命令输出
+[Previous: used edit_file]     ← 知道之前的编辑操作
 ```
 
-**效果**：每轮都清理旧的工具结果，保持上下文精简。
+**3. 长度阈值保护**：只有当原始内容长度 > 100 字符时才压缩。短结果（如 "Wrote 42 bytes"）本身就很短，压缩的收益不大。
+
+**4. KEEP_RECENT = 3 的含义**：保留最近 3 个工具结果的完整内容。这个值平衡了上下文保留和压缩效果——最近的工具结果通常与当前任务最相关。
+
+**5. 原地修改**：注意 `micro_compact` 直接修改 messages 列表中的元素（`result["content"] = ...`），不创建新列表。这是因为 `tool_results` 中的 `part` 是对原始消息对象的引用。
+
+### 2.4 压缩效果计算
+
+```
+假设：
+- 平均每个工具结果 2000 tokens
+- 10 轮对话后积累了 20 个工具结果
+- KEEP_RECENT = 3
+
+压缩前：20 * 2000 = 40,000 tokens
+压缩后：17 * ~5 + 3 * 2000 = 85 + 6000 = 6,085 tokens
+节省：40,000 - 6,085 = 33,915 tokens (84.8%)
+```
 
 ---
 
-## 3. 自动压缩（Auto-compact）
+## 3. Token 估算
 
-### 3.1 思想
-
-当 Token 估算超过阈值时，自动触发深度压缩：
+### 3.1 源码实现
 
 ```python
-# 压缩前（50,000 tokens）：
-messages = [
-    {"role": "user", "content": "原始问题"},
-    # ... 40 轮对话，大量的工具调用和结果 ...
-]
-
-# 压缩后（3,000 tokens）：
-messages = [
-    {"role": "user", "content": """
-[会话已压缩]
-
-摘要：
-用户要求修复登录功能的 bug。
-Agent 读取了 auth.py、database.py、api.py 等文件，
-发现密码验证逻辑错误，已修复并通过测试。
-
-原始问题已解决，所有测试通过。
-"""},
-    {"role": "assistant", "content": "了解，继续工作。"}
-]
-```
-
-### 3.2 Token 估算
-
-```python
-import tiktoken
-
 def estimate_tokens(messages: list) -> int:
-    """估算消息列表的 Token 数量"""
-    # 使用 cl100k_base 编码器（GPT-4/Claude 类似）
-    encoder = tiktoken.get_encoding("cl100k_base")
-
-    total = 0
-    for msg in messages:
-        # 角色名
-        total += len(encoder.encode(msg["role"]))
-        # 内容
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            for part in content:
-                total += len(encoder.encode(str(part)))
-        else:
-            total += len(encoder.encode(content))
-
-    return total
+    """Rough token count: ~4 chars per token."""
+    return len(str(messages)) // 4
 ```
 
-### 3.3 压缩实现
+### 3.2 精度分析
+
+这个估算方法非常简化——它将整个 messages 列表转为字符串，然后除以 4。其精度特点：
+
+1. **~4 字符/token 是粗略近似**：不同模型的 tokenizer 差异很大。Claude 使用自己的 tokenizer，GPT-4 使用 cl100k_base，Llama 使用 sentencepiece。实际比例可能在 3-5 字符/token 之间浮动。
+2. **`str(messages)` 的开销**：将 Python 对象转为字符串会包含 JSON 结构字符（花括号、引号、逗号等），这些不是真实的 token，导致估算偏高。
+3. **`hasattr`/`block` 对象**：Anthropic SDK 返回的 content block 是自定义对象，`str()` 转换可能产生冗余文本。
+4. **总体偏差**：估算通常偏高 10-30%，这意味着实际 Token 数可能低于估算值。
+
+### 3.3 为什么不使用精确 tokenizer？
+
+1. **避免额外依赖**：不需要安装 tiktoken 等库
+2. **跨模型兼容**：不绑定特定模型的 tokenizer
+3. **偏大比偏小安全**：提前触发压缩，避免实际超出窗口限制
+4. **性能考虑**：`len(str()) // 4` 比 tokenizer 编码快几个数量级
+
+### 3.4 改进方向
+
+如果需要更精确的估算，可以考虑：
 
 ```python
-import json
-import time
-from pathlib import Path
+# 方案 A：使用 Anthropic 的 Token 计数 API（最精确，但有网络开销）
+response = client.count_tokens(model=MODEL, messages=messages)
+token_count = response.input_tokens
 
-TRANSCRIPT_DIR = Path(".transcripts")
-TRANSCRIPT_DIR.mkdir(exist_ok=True)
+# 方案 B：使用 tiktoken 近似（离线，较快）
+import tiktoken
+encoder = tiktoken.get_encoding("cl100k_base")
+token_count = sum(len(encoder.encode(str(msg))) for msg in messages)
+```
 
-COMPACT_THRESHOLD = 50000  # Token 阈值
+---
+
+## 4. 自动压缩（Auto-compact）—— Layer 2
+
+### 4.1 触发条件
+
+```python
+THRESHOLD = 50000  # Token 阈值
+
+# 在 agent_loop 中，每轮调用前检查：
+if estimate_tokens(messages) > THRESHOLD:
+    print("[auto_compact triggered]")
+    messages[:] = auto_compact(messages)
+```
+
+注意 `messages[:] =` 的写法——这是原地替换列表内容，确保外部引用（如 `history` 列表）也能看到更新。
+
+### 4.2 源码实现分析
+
+```python
+TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 
 def auto_compact(messages: list) -> list:
-    """自动深度压缩"""
-    # 1. 保存完整记录到磁盘
-    timestamp = int(time.time())
-    transcript_path = TRANSCRIPT_DIR / f"transcript_{timestamp}.jsonl"
-
-    with open(transcript_path, "w", encoding="utf-8") as f:
+    # 步骤 1：保存完整记录到磁盘
+    TRANSCRIPT_DIR.mkdir(exist_ok=True)
+    transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
+    with open(transcript_path, "w") as f:
         for msg in messages:
-            f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+            f.write(json.dumps(msg, default=str) + "\n")
+    print(f"[transcript saved: {transcript_path}]")
 
-    # 2. 请求 LLM 生成摘要
-    summary_prompt = f"""请将以下对话历史压缩为简洁的摘要。
-
-摘要应该包含：
-1. 原始用户请求
-2. 执行的主要操作
-3. 当前的状态和结果
-4. 任何待办事项
-
-对话历史：
-{json.dumps(messages, ensure_ascii=False)[:80000]}
-
-请生成摘要："""
-
-    summary_response = client.messages.create(
+    # 步骤 2：请求 LLM 生成摘要
+    conversation_text = json.dumps(messages, default=str)[:80000]
+    response = client.messages.create(
         model=MODEL,
-        messages=[{"role": "user", "content": summary_prompt}],
+        messages=[{"role": "user", "content":
+            "Summarize this conversation for continuity. Include: "
+            "1) What was accomplished, 2) Current state, "
+            "3) Key decisions made. "
+            "Be concise but preserve critical details.\n\n" + conversation_text}],
         max_tokens=2000,
     )
+    summary = response.content[0].text
 
-    summary = summary_response.content[0].text
-
-    # 3. 用摘要替换历史
+    # 步骤 3：用摘要替换整个消息历史
     return [
-        {
-            "role": "user",
-            "content": f"[会话已压缩于 {timestamp}]\n\n{summary}"
-        },
-        {
-            "role": "assistant",
-            "content": "了解。请继续当前工作。"
-        }
+        {"role": "user", "content":
+            f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}"},
+        {"role": "assistant", "content":
+            "Understood. I have the context from the summary. Continuing."},
     ]
 ```
 
-### 3.4 触发机制
+### 4.3 关键实现细节
 
-```python
-def agent_loop(query):
-    messages = [{"role": "user", "content": query}]
+**1. `json.dumps(msg, default=str)`**：使用 `default=str` 处理不可序列化的对象。Anthropic SDK 返回的 TextBlock、ToolUseBlock 等自定义对象不是原生可 JSON 序列化的，`default=str` 将它们转为字符串表示。
 
-    while True:
-        # 微压缩
-        messages = micro_compact(messages)
+**2. `conversation_text[:80000]`**：截断到 80,000 字符。这是一个安全措施——如果对话非常长，完整的 JSON 可能超出 LLM 的输入窗口。80,000 字符约等于 20,000 tokens，在摘要请求的上下文中是合理的。
 
-        # 检查是否需要自动压缩
-        if estimate_tokens(messages) > COMPACT_THRESHOLD:
-            print(f"[自动压缩] 估算 Token: {estimate_tokens(messages)}, 阈值: {COMPACT_THRESHOLD}")
-            messages = auto_compact(messages)
+**3. 摘要提示词的结构**：明确要求 LLM 包含三个方面：
+   - 已完成的工作（What was accomplished）
+   - 当前状态（Current state）
+   - 关键决策（Key decisions）
 
-        response = client.messages.create(...)
-        # ... 其余逻辑
+**4. 返回格式**：压缩后的消息列表只有 2 条消息：
+   - `user` 消息：包含压缩标记、转录文件路径和摘要内容
+   - `assistant` 消息：确认收到摘要，准备继续工作
+
+**5. 额外 API 调用的成本**：自动压缩需要一次额外的 LLM 调用来生成摘要（消耗约 2000 output tokens），但这换来的是后续所有调用都使用精简的上下文，整体上节省大量 Token。
+
+### 4.4 压缩效果
+
+```
+压缩前：50,000+ tokens（完整对话历史）
+摘要请求：~20,000 input + ~1,000 output = ~21,000 tokens（一次性）
+压缩后：~1,500 tokens（2 条消息：摘要 + 确认）
+
+后续每次调用的节省：50,000 - 1,500 = 48,500 tokens
+假设压缩后再进行 10 轮对话：总共节省 485,000 tokens
+减去摘要成本 21,000 tokens → 净节省 464,000 tokens
 ```
 
 ---
 
-## 4. 手动压缩（Manual-compact）
+## 5. 手动压缩（Manual-compact）—— Layer 3
 
-### 4.1 思想
-
-让 Agent 自己决定何时压缩：
+### 5.1 工具定义
 
 ```python
-# Agent 可以主动调用
-tool_use: compact()
+{"name": "compact",
+ "description": "Trigger manual conversation compression.",
+ "input_schema": {
+     "type": "object",
+     "properties": {
+         "focus": {
+             "type": "string",
+             "description": "What to preserve in the summary"
+         }
+     }
+ }}
 ```
 
-### 4.2 工具定义
+### 5.2 触发机制
+
+手动压缩的触发流程与自动压缩不同，它发生在工具调用结果被添加到消息之后：
 
 ```python
-TOOLS.append({
-    "name": "compact",
-    "description": "压缩当前对话历史。当上下文过长或不再需要详细历史时使用。",
-    "input_schema": {
-        "type": "object",
-        "properties": {},
-        "required": []
-    }
-})
+# 在 agent_loop 中
+results = []
+manual_compact = False
+for block in response.content:
+    if block.type == "tool_use":
+        if block.name == "compact":
+            manual_compact = True
+            output = "Compressing..."
+        else:
+            handler = TOOL_HANDLERS.get(block.name)
+            output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+        results.append({"type": "tool_result", ...})
 
-TOOL_HANDLERS["compact"] = lambda **kw: auto_compact(messages)
+messages.append({"role": "user", "content": results})
+
+# Layer 3：手动压缩触发点
+if manual_compact:
+    print("[manual compact]")
+    messages[:] = auto_compact(messages)
 ```
 
-### 4.3 Agent 的使用场景
+### 5.3 关键实现细节
+
+1. **compact 工具的处理器不执行实际压缩**：`TOOL_HANDLERS["compact"]` 只返回 `"Manual compression requested."` 字符串。实际压缩在 `agent_loop` 中通过检查 `manual_compact` 标志来触发。
+2. **压缩在 tool_result 添加之后执行**：这确保了 compact 工具调用本身也被记录在转录文件中。
+3. **复用 auto_compact 逻辑**：手动压缩调用的是同一个 `auto_compact()` 函数，共享转录保存和摘要生成逻辑。
+4. **focus 参数**：虽然工具定义中有 `focus` 参数，但在当前实现中并未被使用。这是一个扩展点——可以在摘要提示词中加入 focus 参数，引导 LLM 保留特定方面的信息。
+
+### 5.4 Agent 的使用场景
 
 ```
 LLM：我已经完成了第一个阶段的开发，现在进入第二阶段。
       详细的文件读取记录不再需要了。
       tool_use: compact()
 
-工具结果：[会话已压缩]
+工具结果：Compressing...
+[manual compact]
+[transcript saved: .transcripts/transcript_1712000000.jsonl]
 
-LLM：继续第二阶段...
+LLM：Understood. I have the context from the summary. Continuing.
+     继续第二阶段...
 ```
+
+**适用场景**：
+- 完成一个大的任务阶段后，清理前阶段的详细信息
+- Agent 识别到上下文过长，主动压缩以保持性能
+- 在开始全新话题前，清除旧话题的痕迹
 
 ---
 
-## 5. 转录存档
+## 6. 转录存档
 
-### 5.1 为什么要保存完整历史
+### 6.1 为什么要保存完整历史
 
 压缩会丢失细节，但完整历史可能有价值：
-- 调试：查看 Agent 的完整决策过程
-- 审计：了解做了哪些修改
-- 学习：分析 Agent 的行为模式
+- **调试**：查看 Agent 的完整决策过程
+- **审计**：了解做了哪些文件修改
+- **学习**：分析 Agent 的行为模式和效率
+- **恢复**：在必要时回退到压缩前的状态
 
-### 5.2 存储格式
+### 6.2 JSONL 存储格式
 
-使用 JSONL（每行一个 JSON 对象）：
+转录文件使用 JSONL（JSON Lines）格式，每行一个独立的 JSON 对象：
 
 ```jsonl
 {"role": "user", "content": "修复登录 bug"}
-{"role": "assistant", "content": [{"type": "tool_use", ...}]}
-{"role": "user", "content": [{"type": "tool_result", ...}]}
-{"role": "assistant", "content": [{"type": "tool_use", ...}]}
+{"role": "assistant", "content": [{"type": "text", "text": "Let me check the code..."}, {"type": "tool_use", "id": "toolu_01", "name": "read_file", "input": {"path": "auth.py"}}]}
+{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_01", "content": "def authenticate(user, password):\n    ..."}]}
+{"role": "assistant", "content": [{"type": "text", "text": "Found the issue..."}, {"type": "tool_use", "id": "toolu_02", "name": "edit_file", "input": {"path": "auth.py", "old_text": "...", "new_text": "..."}}]}
+{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_02", "content": "Edited auth.py"}]}
 ...
 ```
 
-### 5.3 恢复机制
+**JSONL 格式的优势**：
+1. **逐行可解析**：每行是完整的 JSON，不需要解析整个文件
+2. **追加友好**：可以直接在文件末尾追加新消息
+3. **容错性好**：某一行损坏不影响其他行的解析
+4. **流式处理**：可以逐行读取处理大文件，不需要全部加载到内存
+5. **兼容 `json.loads`**：每行直接 `json.loads(line)` 即可
+
+### 6.3 文件命名规则
+
+```python
+transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
+```
+
+文件名使用 Unix 时间戳，例如：
+- `transcript_1712000000.jsonl` — 第一次压缩时保存
+- `transcript_1712001000.jsonl` — 第二次压缩时保存
+
+**排序性**：时间戳保证文件名按时间顺序排列，方便查找最新的转录文件。
+
+### 6.4 恢复机制
 
 ```python
 def load_transcript(transcript_path: Path) -> list:
@@ -398,268 +450,384 @@ def load_transcript(transcript_path: Path) -> list:
     return messages
 ```
 
+> **警告：恢复的消息列表不能直接传给 API**
+>
+> `load_transcript()` 恢复的消息中可能包含 Anthropic SDK 的自定义对象（如 TextBlock、ToolUseBlock）。这些对象在保存时被 `default=str` 转为了字符串表示，恢复后变成了普通字符串而非 SDK 对象。如果直接将恢复的消息列表传给 `client.messages.create()`，API 会因为无法识别这些对象的格式而报错。
+>
+> 因此，恢复的转录文件仅适用于以下场景：
+> - 人工审查和调试（打印、搜索、分析）
+> - 提取关键信息后手动构建新的消息列表
+> - 构建专门的适配层将字符串转回 SDK 对象（高级用法）
+
+**实际用途**：
+- 人工审查 Agent 的完整决策过程
+- 分析哪些操作是成功的、哪些是失败的
+- 提取关键信息（如修改了哪些文件、执行了哪些命令）
+
 ---
 
-## 6. 三层压缩的协同
+## 7. 三层压缩的协同
 
-### 6.1 工作流程
+### 7.1 在 agent_loop 中的执行顺序
+
+```python
+def agent_loop(messages: list):
+    while True:
+        # Layer 1：微压缩（每轮都执行）
+        micro_compact(messages)
+
+        # Layer 2：自动压缩（Token 阈值触发）
+        if estimate_tokens(messages) > THRESHOLD:
+            print("[auto_compact triggered]")
+            messages[:] = auto_compact(messages)
+
+        # 正常 LLM 调用
+        response = client.messages.create(...)
+        messages.append({"role": "assistant", "content": response.content})
+
+        # 检查是否需要继续循环
+        if response.stop_reason != "tool_use":
+            return
+
+        # 处理工具调用
+        results = []
+        manual_compact = False
+        for block in response.content:
+            if block.type == "tool_use":
+                if block.name == "compact":
+                    manual_compact = True
+                    output = "Compressing..."
+                else:
+                    output = handler(**block.input)
+                results.append({"type": "tool_result", ...})
+        messages.append({"role": "user", "content": results})
+
+        # Layer 3：手动压缩（Agent 主动调用）
+        if manual_compact:
+            messages[:] = auto_compact(messages)
+```
+
+### 7.2 执行流程图
 
 ```
 每轮循环：
 ┌─────────────────────────────────────┐
-│ 1. 微压缩（总是执行）                │
-│    - 替换旧的工具结果                │
-│    - 成本：~0                        │
+│ Layer 1：微压缩 micro_compact       │
+│   - 收集所有 tool_result 位置       │
+│   - 构建 tool_use_id → name 映射    │
+│   - 替换超过 KEEP_RECENT 的旧结果   │
+│   - 成本：~0（纯字符串替换）        │
 └─────────────────────────────────────┘
            │
            ▼
 ┌─────────────────────────────────────┐
-│ 2. Token 预算检查                    │
-│    - 估算当前 Token 数               │
-│    - 超过阈值？                      │
+│ Token 预算检查                      │
+│   - estimate_tokens(messages)       │
+│   - 返回值 > THRESHOLD (50000)？    │
 └─────────────────────────────────────┘
            │
-           ├─ 否 ─→ 继续正常循环
+           ├── 否 ──→ 继续正常循环
            │
-           └─ 是 ─▼
+           └── 是 ──▼
 ┌─────────────────────────────────────┐
-│ 3. 自动压缩（触发时执行）            │
-│    - 保存完整记录                    │
-│    - 生成摘要                        │
-│    - 替换历史                        │
+│ Layer 2：自动压缩 auto_compact      │
+│   - 保存完整记录到 .transcripts/    │
+│   - 请求 LLM 生成摘要              │
+│   - 用 [摘要 + 确认] 替换全部历史   │
+│   - 成本：1 次 LLM 调用            │
 └─────────────────────────────────────┘
-
-随时（Agent 决定）：
+           │
+           ▼
 ┌─────────────────────────────────────┐
-│ 手动压缩                             │
-│ - Agent 调用 compact 工具            │
-│ - 同自动压缩机制                     │
+│ 正常 LLM 调用                      │
+│   - 发送 messages + tools + system  │
+│   - 接收响应                       │
+└─────────────────────────────────────┘
+           │
+           ▼
+┌─────────────────────────────────────┐
+│ 工具调用处理                        │
+│   - 若调用 compact → 设置标志      │
+│   - 其他工具 → 正常执行            │
+└─────────────────────────────────────┘
+           │
+           ▼
+┌─────────────────────────────────────┐
+│ Layer 3：手动压缩检查               │
+│   - compact 标志为 True？           │
+│   - 是 → 执行 auto_compact         │
 └─────────────────────────────────────┘
 ```
 
-### 6.2 参数调优
+### 7.3 参数调优
 
-| 参数 | 推荐值 | 说明 |
-|------|--------|------|
-| `KEEP_RECENT` | 5-10 | 微压缩保留的工具结果数 |
-| `COMPACT_THRESHOLD` | 50000-100000 | 自动压缩的 Token 阈值 |
-| `SUMMARY_TOKENS` | 2000-4000 | 摘要的最大 Token 数 |
+| 参数 | 源码值 | 说明 | 调优建议 |
+|------|--------|------|----------|
+| `KEEP_RECENT` | 3 | 微压缩保留的最近工具结果数 | 复杂任务可增至 5-10；简单任务可降至 2 |
+| `THRESHOLD` | 50000 | 自动压缩的 Token 阈值 | 取决于模型窗口大小，建议设为窗口的 25%-40% |
+| `max_tokens`（摘要） | 2000 | 摘要的最大 Token 数 | 复杂任务可增至 4000；简单场景可降至 1000 |
+| 截断长度 | 80000 字符 | 摘要请求中对话文本的最大长度 | 约等于 20000 tokens，可根据模型窗口调整 |
 
-### 6.3 效果对比
+### 7.4 效果对比
 
 ```
 无压缩：
-轮次 1-50：正常增长
-轮次 51：超出窗口，无法继续
+  轮次 1-50：正常增长
+  轮次 51：超出窗口，API 报错，无法继续
 
-有微压缩：
-轮次 1-100：缓慢增长（旧结果被替换）
-轮次 101：超出窗口
+有微压缩（Layer 1 only）：
+  轮次 1-100：缓慢增长（旧结果被替换为占位符）
+  轮次 101：仍然超出窗口（消息数量本身也在增长）
 
-有微压缩 + 自动压缩：
-轮次 1-200：正常增长
-自动触发：压缩为摘要
-轮次 201-400：再次增长
-自动触发：再次压缩
-...
-可以无限继续
+有微压缩 + 自动压缩（Layer 1 + 2）：
+  轮次 1-200：正常增长
+  自动触发：50,000 tokens → 压缩为 ~1,500 tokens
+  轮次 201-400：再次增长
+  自动触发：再次压缩
+  ...
+  可以无限继续
+
+有微压缩 + 自动压缩 + 手动压缩（Layer 1 + 2 + 3）：
+  同上 + Agent 可以在阶段切换时主动清理
+  更精确地控制上下文内容
 ```
 
 ---
 
-## 7. 与 s05 的对比
+## 8. 与 s05 的对比
 
 | 方面 | s05 技能系统 | s06 上下文压缩 |
 |------|-------------|----------------|
 | 问题 | 静态知识浪费 Token | 动态对话消耗 Token |
-| 解决方案 | 按需加载 | 三层压缩 |
-| 触发时机 | LLM 请求时 | 每轮（微）+ 阈值（自动） |
+| 解决方案 | 两层注入（按需加载） | 三层压缩（按需遗忘） |
+| 触发时机 | LLM 请求时（load_skill） | 每轮（微）+ 阈值（自动）+ 主动（手动） |
 | 存储位置 | skills/ 目录 | .transcripts/ 目录 |
+| 文件格式 | SKILL.md（Markdown） | transcript_*.jsonl（JSON Lines） |
 | 目标 | 减少 Token 成本 | 实现无限会话 |
+| 互补性 | 控制知识注入量 | 控制上下文膨胀量 |
+
+**协同设计**：s05 控制的是"知识进入上下文的方式"（按需加载），s06 控制的是"上下文随时间增长的方式"（按需遗忘）。两者结合，使得 Agent 既能获取需要的知识，又不会因历史积累而崩溃。
 
 ---
 
-## 8. 常见问题
+## 9. 常见问题
 
 ### Q1：为什么不在每轮都进行深度压缩？
 
-**答案**：深度压缩的成本：
-1. 需要 LLM 生成摘要（额外 API 调用）
-2. 会丢失对话细节
-3. 可能需要频繁恢复历史
+**答案**：深度压缩的成本太高：
+1. 每次压缩需要一次额外的 LLM API 调用（~21,000 tokens）
+2. 会丢失对话细节（摘要可能遗漏重要信息）
+3. 如果每轮都压缩，API 调用次数翻倍
 
-微压缩的成本几乎为零，适合每轮执行。
+微压缩的成本几乎为零（只是字符串替换），适合每轮执行。深度压缩只在真正需要时触发。
 
 ### Q2：压缩后如何恢复之前的细节？
 
 **答案**：
 ```python
-# 从转录文件恢复
-messages = load_transcript(TRANSCRIPT_DIR / "transcript_123456.jsonl")
-# 然后继续使用这些消息
+# 从转录文件恢复（用于人工审查，不能直接传给 API）
+messages = load_transcript(Path(".transcripts/transcript_1712000000.jsonl"))
 ```
 
-但通常不需要——摘要应该包含足够的信息来继续工作。
+但通常不需要恢复——摘要应该包含足够的信息来继续工作。转录文件主要用于事后分析和调试。
 
 ### Q3：Token 估算准确吗？
 
-**答案**：不完全准确，但足够用于触发压缩：
-1. 不同模型的 Token 算法不同
-2. 估算通常偏大 10-20%
-3. 宁可早压缩也不要晚压缩
+**答案**：不完全准确，但对于触发压缩来说够用了：
+1. `len(str(messages)) // 4` 是粗略近似，实际比例因模型而异
+2. 估算通常偏高 10-30%（包含 JSON 结构字符）
+3. 偏大比偏小安全——宁可早压缩也不要晚压缩
+4. 如果需要精确值，应使用 Anthropic 的 Token 计数 API
 
-### Q4：压缩会影响性能吗？
+### Q4：压缩会影响 Agent 的性能吗？
 
 **答案**：
-- 微压缩：不影响（只是字符串替换）
-- 自动压缩：轻微影响（需要额外的 API 调用）
-- 总体：压缩避免了上下文溢出，整体性能更好
+- **微压缩**：几乎无影响。只是字符串替换，不改变消息结构。占位符 `[Previous: used read_file]` 保留了足够的语义信息。
+- **自动压缩**：有一次性成本（1 次 LLM 调用），但换来后续所有调用的上下文缩减。
+- **总体**：压缩避免了上下文溢出和性能退化，整体上让 Agent 保持更好的表现。
+
+### Q5：KEEP_RECENT = 3 够用吗？
+
+**答案**：取决于任务复杂度：
+- **简单任务**（3-5 轮就能完成）：3 个足够
+- **中等任务**（10-20 轮）：5-8 个更合适，避免丢失关键上下文
+- **复杂任务**（50+ 轮）：建议 10 个，同时配合更低的 THRESHOLD 触发自动压缩
+
+### Q6：压缩后 Agent 行为异常怎么办？
+
+压缩（尤其是自动压缩）会丢失大量对话细节，可能导致 Agent 出现以下问题：
+
+| 异常表现 | 根因 | 解决方法 |
+|----------|------|----------|
+| Agent 忘记之前的工作 | 摘要遗漏了已完成任务的细节 | 在摘要提示词中强调"列出所有已完成的工作"；或降低 THRESHOLD 让压缩更早触发（减少单次压缩的信息损失） |
+| 重复已完成任务 | 摘要未记录已完成的步骤 | 手动调用 compact 时使用 focus 参数，明确指定保留哪些进度信息 |
+| 偏离原始目标 | 摘要丢失了用户的初始需求 | 摘要提示词中增加"完整保留用户的原始请求"；或在 system prompt 中固定关键目标 |
+
+**通用排查步骤**：
+
+1. 查看 `.transcripts/` 中最新的转录文件，确认压缩前的完整上下文
+2. 检查摘要内容是否遗漏了关键信息（任务进度、用户需求、重要决策）
+3. 如果频繁出现异常，考虑调整参数：增大 KEEP_RECENT、降低 THRESHOLD、或在摘要提示词中增加更多结构化要求
+4. 极端情况下，可以从转录文件恢复完整上下文，重新构建消息列表
 
 ---
 
-## 9. 最佳实践
+## 10. 最佳实践
 
-### 9.1 监控 Token 使用
+### 10.1 监控 Token 使用
 
 ```python
-def agent_loop(query):
-    messages = [{"role": "user", "content": query}]
-
+# 在 agent_loop 中添加日志
+def agent_loop(messages: list):
     while True:
         messages = micro_compact(messages)
-
-        # 监控
         token_count = estimate_tokens(messages)
-        if token_count % 10000 == 0:  # 每 10000 打印一次
-            print(f"[Token 监控] 当前: {token_count}")
+        print(f"[Token 估算: {token_count}]")  # 添加监控日志
 
-        if token_count > COMPACT_THRESHOLD:
-            messages = auto_compact(messages)
+        if token_count > THRESHOLD:
+            messages[:] = auto_compact(messages)
         # ...
 ```
 
-### 9.2 智能摘要
+### 10.2 智能摘要（改进方向）
+
+当前实现使用通用摘要提示词。可以加入上下文感知：
 
 ```python
-def auto_compact(messages: list, context: dict) -> list:
-    """带上下文的智能压缩"""
-    summary_prompt = f"""生成会话摘要。
-
-当前上下文：
-- 用户目标：{context.get('goal')}
-- 已完成任务：{context.get('completed')}
-- 待办任务：{context.get('pending')}
-
-请基于这些信息生成摘要...
-"""
+def auto_compact(messages: list, focus: str = None) -> list:
+    prompt = "Summarize this conversation for continuity."
+    if focus:
+        prompt += f" Pay special attention to: {focus}"
     # ...
 ```
 
-### 9.3 分段压缩
+这样手动压缩时可以通过 `focus` 参数引导摘要保留特定信息。
+
+### 10.3 分段压缩（改进方向）
+
+当前实现是"全量压缩"——将所有消息替换为摘要。更精细的方式是分段压缩：
 
 ```python
-def segmented_compact(messages: list, segment_size: int = 20):
-    """分段压缩，保留最近几段完整"""
-    # 保留最近 20 轮完整
-    recent = messages[-segment_size:]
-    # 压缩更早的部分
-    older = messages[:-segment_size]
-    compressed = summarize(older)
-    return compressed + recent
+def segmented_compact(messages: list, keep_recent: int = 20):
+    """保留最近 N 条消息完整，只压缩更早的部分"""
+    recent = messages[-keep_recent:]
+    older = messages[:-keep_recent]
+    compressed_summary = summarize(older)
+    return [
+        {"role": "user", "content": f"[Earlier summary]\n{compressed_summary}"},
+        {"role": "assistant", "content": "Understood."},
+    ] + recent
 ```
 
 ---
 
-## 10. 小结
+## 11. 小结
 
-### 10.1 核心要点
+### 11.1 核心要点
 
 | 要点 | 说明 |
 |------|------|
-| **微压缩** | 每轮执行，替换旧工具结果 |
-| **自动压缩** | 阈值触发，生成摘要替换历史 |
-| **手动压缩** | Agent 主动调用 |
-| **转录存档** | 保存完整历史到磁盘 |
+| **Layer 1 微压缩** | 每轮执行，将超过 KEEP_RECENT (3) 的旧工具结果替换为占位符 |
+| **Layer 2 自动压缩** | 当 estimate_tokens > THRESHOLD (50000) 时触发，保存转录、生成摘要 |
+| **Layer 3 手动压缩** | Agent 主动调用 compact 工具，复用 auto_compact 逻辑 |
+| **Token 估算** | `len(str(messages)) // 4`，粗略但安全（偏高 10-30%） |
+| **转录存档** | JSONL 格式，每行一条消息，使用时间戳命名 |
+| **tool_name 映射** | 微压缩通过匹配 tool_use_id 找到工具名，生成信息量更高的占位符 |
 
-### 10.2 代码模板
+### 11.2 代码模板
 
 ```python
-def agent_loop(query):
-    messages = [{"role": "user", "content": query}]
+# 常量定义
+KEEP_RECENT = 3          # 微压缩保留的最近工具结果数
+THRESHOLD = 50000        # 自动压缩的 Token 阈值
+TRANSCRIPT_DIR = Path(".transcripts")
 
+def agent_loop(messages: list):
     while True:
-        # 层 1：微压缩
-        messages = micro_compact(messages)
+        # Layer 1：微压缩（每轮）
+        micro_compact(messages)
 
-        # 层 2：自动压缩
+        # Layer 2：自动压缩（阈值触发）
         if estimate_tokens(messages) > THRESHOLD:
-            messages = auto_compact(messages)
+            messages[:] = auto_compact(messages)
 
-        # 正常循环
-        response = client.messages.create(messages=messages, ...)
+        # 正常 LLM 调用
+        response = client.messages.create(...)
 
-        # 层 3：检查手动压缩
-        if uses_compact_tool(response):
-            messages = auto_compact(messages)
-        # ...
+        # Layer 3：手动压缩（Agent 主动调用 compact 工具）
+        if manual_compact:
+            messages[:] = auto_compact(messages)
 ```
 
-### 10.3 关键洞察
+### 11.3 关键洞察
 
 ```
 上下文压缩的核心思想：
-1. 不同年龄的信息价值不同
-2. 旧工具结果可以替换为占位符
-3. 整个对话可以浓缩为摘要
-4. 完整历史可以存档到磁盘
+1. 不同年龄的信息价值不同——旧的工具结果可以安全丢弃
+2. 微压缩是"外科手术"——精准替换单个工具结果
+3. 自动压缩是"核弹"——用摘要替换整个历史
+4. 手动压缩是"主动防御"——Agent 自主决定何时清理
+5. 转录存档保证"可恢复性"——压缩不等于永久丢失
 
 设计原则：
-- 轻量压缩每轮执行
-- 重量压缩按需触发
-- 存档保证可恢复性
-- 摘要保持上下文连续性
+- 轻量压缩每轮执行（微压缩，零成本）
+- 重量压缩按需触发（自动压缩，有成本但值得）
+- 存档保证可追溯（JSONL 转录文件）
+- 摘要保持上下文连续性（LLM 生成的结构化摘要）
+- 宁可早压缩也不要晚压缩（估算偏高是安全的）
 ```
 
 ---
 
-## 11. 练习
+## 12. 练习
 
 ### 练习 1：改进 Token 估算
 
-实现更精确的 Token 估算，考虑不同内容类型的差异。
+实现更精确的 Token 估算：
+1. 使用 Anthropic 的 Token 计数 API
+2. 或者使用 `len(str(messages)) // 3.5` 等更准确的比例
+3. 对比两种方法的精度差异
 
 ### 练习 2：压缩策略选择
 
-添加压缩级别参数（light/medium/aggressive），调整压缩强度。
+添加压缩级别参数（light/medium/aggressive），调整：
+- light：KEEP_RECENT=5, THRESHOLD=80000
+- medium：KEEP_RECENT=3, THRESHOLD=50000
+- aggressive：KEEP_RECENT=1, THRESHOLD=30000
 
-### 练习 3：语义压缩
+### 练习 3：利用 focus 参数
 
-使用嵌入模型对消息进行聚类，保留语义多样化的消息。
+在手动压缩时利用 compact 工具的 `focus` 参数，引导摘要保留特定方面的信息。
 
 ### 练习 4：压缩预览
 
-实现 `compact_preview` 工具，让 Agent 在压缩前看到摘要，决定是否执行。
+实现 `compact_preview` 工具，让 Agent 在压缩前先看到摘要内容，再决定是否执行压缩。
 
 ---
 
-## 12. 第一阶段总结
+## 13. 第一阶段总结
 
 恭喜！你完成了第一阶段的学习（s01-s06）：
 
-| 章节 | 主题 | 掌握的技能 |
-|------|------|------------|
-| s01 | Agent 循环 | 最小可用 Agent |
-| s02 | 工具系统 | 多工具分发器 |
-| s03 | 任务规划 | TodoManager |
-| s04 | 子 Agent | 上下文隔离 |
-| s05 | 技能系统 | 按需加载知识 |
-| s06 | 上下文压缩 | 无限会话 |
+| 章节 | 主题 | 核心能力 |
+|------|------|----------|
+| s01 | Agent 循环 | 最小可用 Agent（while True 循环 + tool_use 分发） |
+| s02 | 工具系统 | 多工具分发器（TOOL_HANDLERS 字典） |
+| s03 | 任务规划 | TodoManager（内存列表 + 渲染文本 + 提醒机制） |
+| s04 | 子 Agent | 上下文隔离（独立消息列表 + 结果摘要） |
+| s05 | 技能系统 | 按需加载知识（两层注入 + SKILL.md） |
+| s06 | 上下文压缩 | 无限会话（三层压缩 + JSONL 转录） |
 
-**你现在已经可以构建一个功能完整的 AI 编程助手！**
+**你现在已经可以构建一个功能完整的 AI 编程助手！** 它具备：
+- 工具调用能力（读写文件、执行命令）
+- 任务规划和跟踪能力
+- 子任务委托和上下文隔离
+- 按需加载专业知识
+- 长对话的上下文管理
 
 ---
 
-## 13. 下一步
+## 14. 下一步
 
 第一阶段的 Agent 是单次会话的，任务状态只存在内存中。接下来我们将进入**持久化**阶段。
 

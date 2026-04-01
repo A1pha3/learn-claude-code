@@ -11,9 +11,9 @@
 完成本章后，你将能够：
 
 1. **理解团队 vs 子 Agent** —— 为什么需要持久化的队友
-2. **掌握 MessageBus** —— Agent 间的通信机制
-3. **实现 TeammateManager** —— 队友生命周期管理
-4. **理解 JSONL 邮箱** —— 持久化的消息传递
+2. **掌握 MessageBus** —— 基于 JSONL 邮箱的异步通信机制
+3. **实现 TeammateManager** —— 队友生命周期管理（spawn → work → idle → shutdown）
+4. **理解 JSONL 邮箱** —— 持久化的、append-only 的消息传递
 
 ---
 
@@ -34,7 +34,7 @@ uv run python agents/s09_agent_teams.py
 ### 本章完成标准
 
 - 能判断一个任务应该用子 Agent 还是持久化团队。
-- 能独立搭建“创建队友—发消息—收结果”的最小闭环。
+- 能独立搭建"创建队友—发消息—收结果"的最小闭环。
 - 能解释 JSONL 邮箱在可恢复与审计方面的作用。
 
 ---
@@ -46,14 +46,11 @@ uv run python agents/s09_agent_teams.py
 ```python
 # s04: 子 Agent（用完即弃）
 def run_subagent(prompt: str) -> str:
-    # 创建新上下文
     sub_messages = [{"role": "user", "content": prompt}]
-    # 运行循环
     for _ in range(30):
         response = client.messages.create(...)
         # ...
-    # 返回摘要，子 Agent "死亡"
-    return summary
+    return summary  # 返回摘要，子 Agent "死亡"
 ```
 
 **特点**：
@@ -65,198 +62,187 @@ def run_subagent(prompt: str) -> str:
 
 ```python
 # s09: 持久化队友
-teammate = spawn(name="alice", role="coder", prompt="你是代码专家")
-# teammate 持续运行，有自己的上下文
-# 可以接收多次消息
-# 有自己的状态和记忆
+TEAM.spawn(name="alice", role="coder", prompt="你是代码专家")
+# alice 持续运行在自己的线程中
+# 有自己的上下文和消息历史
+# 可以通过邮箱收发消息
+# 完成任务后进入 idle，等待新任务
 ```
 
 **特点**：
-- **持久性**：持续运行，有记忆
-- **双向通信**：可以互相发送消息
-- **独立上下文**：每个队友有自己的消息历史
+- **持久性**：持续运行，有独立上下文和记忆
+- **双向通信**：队友之间可以互相发送消息
+- **状态管理**：working / idle / shutdown
 
 ### 1.3 使用场景对比
 
-```
-子 Agent 适合：
-├── 一次性分析任务
-├── 需要隔离上下文的查询
-└── 临时助手
-
-团队适合：
-├── 长期项目开发
-├── 角色分工（前端/后端/测试）
-├── 需要多轮对话的任务
-└── 持续的团队协作
-```
+| 特性 | 子 Agent（s04） | 团队队友（s09） |
+|------|----------------|----------------|
+| 生命周期 | 临时（用完即弃） | 持久（持续运行） |
+| 上下文 | 每次全新 | 独立累积 |
+| 通信 | 单向（父→子） | 双向（互发消息） |
+| 状态 | 无 | working / idle / shutdown |
+| 适用场景 | 一次性分析、临时助手 | 长期项目、角色分工、多轮协作 |
 
 ---
 
 ## 2. 团队架构
 
-### 2.1 架构图
+### 2.1 整体架构
 
 ```
-                主 Agent (lead)
-                │
-                │ spawn(name="alice", role="coder")
-                ▼
-┌─────────────────────────────────────┐
-│           .team/                     │
-│  ├── config.json                    │
-│  │   ├── {"name": "lead", ...}      │
-│  │   ├── {"name": "alice", ...}     │
-│  │   └── {"name": "bob", ...}       │
-│  │                                  │
-│  └── inbox/                         │
-│      ├── lead.jsonl  ◄───┐          │
-│      ├── alice.jsonl     │          │
-│      └── bob.jsonl       │          │
-└──────────────────────────┼──────────┘
-                           │
-                    MessageBus (send/read)
-                           │
-      ┌────────────────────┼────────────────────┐
-      │                    │                    │
-      ▼                    ▼                    ▼
-┌──────────┐         ┌──────────┐         ┌──────────┐
-│  alice   │         │   bob    │         │  charlie │
-│  循环    │◄───────►│  循环    │◄───────►│  循环    │
-│          │  互相发送  │          │  互相发送  │          │
-│ 检查邮箱 │  消息     │ 检查邮箱 │  消息     │ 检查邮箱 │
-└──────────┘         └──────────┘         └──────────┘
+.team/                              主 Agent (lead)
+├── config.json                     │
+│   ├── {"team_name": "default"}    │ spawn_teammate(name="alice", ...)
+│   ├── {"name":"alice",            ▼
+│   │    "role":"coder",        ┌──────────┐
+│   │    "status":"idle"}       │ config   │
+│   └── {"name":"bob",...}      │ .json    │
+│                               └──────────┘
+└── inbox/                           │
+    ├── lead.jsonl              spawn → 写入 config + 启动线程
+    ├── alice.jsonl                 │
+    └── bob.jsonl              ┌────┴────┐
+                               │         │
+                          ┌────▼───┐ ┌───▼────┐
+                          │ alice  │ │  bob   │
+                          │ 线程   │ │ 线程   │
+                          │ agent  │ │ agent  │
+                          │ loop   │ │ loop   │
+                          └────────┘ └────────┘
+                               ↑         ↑
+                               │  JSONL  │
+                               └─邮箱────┘
 ```
 
-### 2.2 通信机制
+### 2.2 目录结构（源码实际布局）
+
+源码中的目录结构（agents/s09_agent_teams.py 第 62-63 行）：
+
+```python
+TEAM_DIR = WORKDIR / ".team"
+INBOX_DIR = TEAM_DIR / "inbox"
+```
 
 ```
-发送消息 (send)：
-┌─────────┐              ┌──────────┐
-│  alice  │ ─send───────►│ bob.jsonl│
-│         │  ("hello")   │          │
-└─────────┘              └──────────┘
-                              │
-                              │ append
-                              ▼
-                        {"from": "alice",
-                         "content": "hello",
-                         "timestamp": ...}
-
-读取消息 (read_inbox)：
-┌─────────┐              ┌──────────┐
-│   bob   │ ◄─read───────│ bob.jsonl│
-│         │  inbox       │          │
-└─────────┘   返回消息    └──────────┘
-                              │
-                              │ drain
-                              ▼
-                        (文件清空)
+.team/
+├── config.json           # 团队成员配置
+│   {
+│     "team_name": "default",
+│     "members": [
+│       {"name": "alice", "role": "coder", "status": "working"},
+│       {"name": "bob", "role": "tester", "status": "idle"}
+│     ]
+│   }
+└── inbox/                # JSONL 邮箱目录
+    ├── lead.jsonl        # Lead 的收件箱
+    ├── alice.jsonl       # Alice 的收件箱
+    └── bob.jsonl         # Bob 的收件箱
 ```
 
 ---
 
 ## 3. MessageBus 实现
 
-### 3.1 核心类
+### 3.1 核心类（源码分析）
+
+MessageBus 是团队通信的核心。源码位于 `agents/s09_agent_teams.py` 第 77-118 行：
 
 ```python
-import json
-import time
-from pathlib import Path
-from typing import List, Dict, Optional
-
 class MessageBus:
-    def __init__(self, team_dir: Path):
-        self.dir = team_dir / "inbox"
+    def __init__(self, inbox_dir: Path):
+        self.dir = inbox_dir
         self.dir.mkdir(parents=True, exist_ok=True)
-
-    def send(
-        self,
-        sender: str,
-        to: str,
-        content: str,
-        msg_type: str = "message",
-        extra: Optional[Dict] = None
-    ) -> str:
-        """发送消息到收件人的邮箱"""
-        msg = {
-            "type": msg_type,
-            "from": sender,
-            "to": to,
-            "content": content,
-            "timestamp": time.time()
-        }
-
-        if extra:
-            msg.update(extra)
-
-        # 追加到收件人的邮箱文件
-        inbox_path = self.dir / f"{to}.jsonl"
-        with open(inbox_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(msg, ensure_ascii=False) + "\n")
-
-        return f"消息已发送到 {to}"
-
-    def read_inbox(self, name: str) -> str:
-        """读取并清空邮箱"""
-        inbox_path = self.dir / f"{name}.jsonl"
-
-        if not inbox_path.exists():
-            return "[]"
-
-        # 读取所有消息
-        messages = []
-        with open(inbox_path, "r", encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    messages.append(json.loads(line))
-
-        # 清空文件（drain 模式）
-        inbox_path.write_text("", encoding="utf-8")
-
-        return json.dumps(messages, indent=2, ensure_ascii=False)
-
-    def broadcast(
-        self,
-        sender: str,
-        content: str,
-        exclude: Optional[List[str]] = None
-    ) -> str:
-        """广播消息给所有队友"""
-        exclude = exclude or []
-        exclude.append(sender)  # 不发给自己
-
-        # 获取所有邮箱文件
-        recipients = []
-        for f in self.dir.glob("*.jsonl"):
-            name = f.stem  # 文件名（不含 .jsonl）
-            if name not in exclude:
-                recipients.append(name)
-
-        # 发送消息
-        for recipient in recipients:
-            self.send(sender, recipient, content)
-
-        return f"广播已发送给 {len(recipients)} 个队友"
 ```
 
-### 3.2 JSONL 格式的优势
+### 3.2 消息格式
+
+每条消息是一个 JSON 对象，包含以下字段：
+
+```json
+{
+  "type": "message",
+  "from": "lead",
+  "content": "请实现用户登录功能",
+  "timestamp": 1730000000.123
+}
+```
+
+**消息类型**（源码第 67-73 行定义了 5 种类型）：
+
+| 类型 | 用途 | 引入章节 |
+|------|------|----------|
+| `message` | 普通文本消息 | s09 |
+| `broadcast` | 广播给所有队友 | s09 |
+| `shutdown_request` | 请求优雅关机 | s10 |
+| `shutdown_response` | 响应关机请求 | s10 |
+| `plan_approval_response` | 计划审批响应 | s10 |
+
+### 3.3 发送消息（append-only）
+
+```python
+def send(self, sender: str, to: str, content: str,
+         msg_type: str = "message", extra: dict = None) -> str:
+    if msg_type not in VALID_MSG_TYPES:
+        return f"Error: Invalid type '{msg_type}'. Valid: {VALID_MSG_TYPES}"
+    msg = {"type": msg_type, "from": sender, "content": content, "timestamp": time.time()}
+    if extra:
+        msg.update(extra)
+    # 关键：append-only 写入，保证原子性
+    inbox_path = self.dir / f"{to}.jsonl"
+    with open(inbox_path, "a") as f:
+        f.write(json.dumps(msg) + "\n")
+    return f"Sent {msg_type} to {to}"
+```
+
+**设计要点**：
+1. **验证消息类型**：只接受预定义的 5 种类型
+2. **append-only**：`open(path, "a")` 追加写入，操作是原子的
+3. **extra 字段**：支持附加自定义数据（如 request_id）
+
+### 3.4 读取邮箱（drain 模式）
+
+```python
+def read_inbox(self, name: str) -> list:
+    inbox_path = self.dir / f"{name}.jsonl"
+    if not inbox_path.exists():
+        return []
+    messages = []
+    for line in inbox_path.read_text().strip().splitlines():
+        if line:
+            messages.append(json.loads(line))
+    # 关键：读取后清空（drain 模式）
+    inbox_path.write_text("")
+    return messages
+```
+
+**drain 模式的含义**：读取邮箱后立即清空，确保同一条消息不会被重复处理。
+
+### 3.5 广播
+
+```python
+def broadcast(self, sender: str, content: str, teammates: list) -> str:
+    count = 0
+    for name in teammates:
+        if name != sender:  # 不发给自己
+            self.send(sender, name, content, "broadcast")
+            count += 1
+    return f"Broadcast to {count} teammates"
+```
+
+### 3.6 JSONL 格式的优势
 
 ```jsonl
-{"from": "alice", "to": "bob", "content": "你好", "timestamp": 1234567890}
-{"from": "lead", "to": "bob", "content": "状态更新", "timestamp": 1234567891}
-{"from": "charlie", "to": "bob", "content": "代码已提交", "timestamp": 1234567892}
+{"type": "message", "from": "alice", "content": "你好", "timestamp": 1730000000}
+{"type": "broadcast", "from": "lead", "content": "阶段 1 完成", "timestamp": 1730000001}
 ```
-
-**为什么用 JSONL 而不是 JSON 数组？**
 
 | 特性 | JSON 数组 | JSONL |
 |------|-----------|-------|
-| 追加写入 | 需要重写整个文件 | 直接追加 |
-| 并发安全 | 差 | 好（append 原子） |
+| 追加写入 | 需要重写整个文件 | 直接 append（原子操作） |
+| 并发安全 | 差（需要锁整个文件） | 好（append 原子性） |
 | 内存占用 | 需要全部加载 | 可以逐行处理 |
-| 清空操作 | 覆盖文件 | 覆盖文件 |
+| 可恢复性 | 文件损坏 = 全部丢失 | 单行损坏不影响其他行 |
 
 ---
 
@@ -264,256 +250,162 @@ class MessageBus:
 
 ### 4.1 核心类
 
+TeammateManager 管理队友的整个生命周期。源码位于第 123-247 行：
+
 ```python
-import threading
-import json
-from pathlib import Path
-from typing import Dict, List
-
 class TeammateManager:
-    def __init__(self, team_dir: Path, message_bus: MessageBus):
+    def __init__(self, team_dir: Path):
         self.dir = team_dir
-        self.dir.mkdir(exist_ok=True)
-        self.bus = message_bus
         self.config_path = self.dir / "config.json"
-        self.config = self._load_config()
-        self.threads: Dict[str, threading.Thread] = {}
-
-    def _load_config(self) -> Dict:
-        """加载团队配置"""
-        if self.config_path.exists():
-            return json.loads(self.config_path.read_text(encoding="utf-8"))
-        return {"members": []}
-
-    def _save_config(self):
-        """保存团队配置"""
-        self.config_path.write_text(
-            json.dumps(self.config, indent=2, ensure_ascii=False),
-            encoding="utf-8"
-        )
-
-    def _find_member(self, name: str) -> Optional[Dict]:
-        """查找队友"""
-        for member in self.config["members"]:
-            if member["name"] == name:
-                return member
-        return None
-
-    def _update_member(self, name: str, **kwargs):
-        """更新队友信息"""
-        member = self._find_member(name)
-        if member:
-            member.update(kwargs)
-            self._save_config()
-
-    def spawn(
-        self,
-        name: str,
-        role: str,
-        prompt: str,
-        system: Optional[str] = None
-    ) -> str:
-        """创建新队友"""
-        # 检查是否已存在
-        if self._find_member(name):
-            return f"队友 '{name}' 已存在"
-
-        # 添加到配置
-        member = {
-            "name": name,
-            "role": role,
-            "status": "working",
-            "created_at": int(time.time())
-        }
-        self.config["members"].append(member)
-        self._save_config()
-
-        # 启动队友循环（在独立线程中）
-        thread = threading.Thread(
-            target=self._teammate_loop,
-            args=(name, role, prompt, system),
-            daemon=True
-        )
-        thread.start()
-        self.threads[name] = thread
-
-        return f"队友 '{name}' (角色: {role}) 已创建"
-
-    def _teammate_loop(
-        self,
-        name: str,
-        role: str,
-        prompt: str,
-        system: Optional[str]
-    ):
-        """队友的 Agent 循环"""
-        messages = [{"role": "user", "content": prompt}]
-        max_rounds = 50
-
-        for _ in range(max_rounds):
-            # 检查邮箱
-            inbox = self.bus.read_inbox(name)
-            if inbox != "[]":
-                messages.append({
-                    "role": "user",
-                    "content": f"<inbox>\n{inbox}\n</inbox>"
-                })
-                messages.append({
-                    "role": "assistant",
-                    "content": "已阅读收件箱。"
-                })
-
-            # LLM 调用
-            response = client.messages.create(
-                model=MODEL,
-                system=system or f"你是 {name}，角色是 {role}。",
-                messages=messages,
-                tools=CHILD_TOOLS,
-                max_tokens=8000
-            )
-            messages.append({
-                "role": "assistant",
-                "content": response.content
-            })
-
-            # 检查是否继续
-            if response.stop_reason != "tool_use":
-                break
-
-            # 执行工具
-            results = []
-            for block in response.content:
-                if block.type == "tool_use":
-                    handler = TOOL_HANDLERS.get(block.name)
-                    if handler:
-                        output = handler(**block.input)
-                        results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": str(output)[:50000]
-                        })
-
-            messages.append({
-                "role": "user",
-                "content": results
-            })
-
-        # 标记为空闲
-        self._update_member(name, status="idle")
-
-    def list_all(self) -> str:
-        """列出所有队友"""
-        if not self.config["members"]:
-            return "无队友"
-
-        lines = ["团队成员："]
-        for member in self.config["members"]:
-            status_emoji = {
-                "working": "🔄",
-                "idle": "💤",
-                "shutdown": "⏹️"
-            }
-            emoji = status_emoji.get(member["status"], "❓")
-            lines.append(f"  {emoji} {member['name']} ({member['role']})")
-
-        return "\n".join(lines)
+        self.config = self._load_config()  # 从磁盘加载
+        self.threads = {}  # name → Thread 映射
 ```
+
+### 4.2 队友生命周期
+
+```
+spawn → working → idle → working → idle → ... → shutdown
+  │                                                  │
+  │ 创建线程                                         │ 超过 50 轮或异常
+  ▼                                                  ▼
+config.json:                     config.json:
+{"status": "working"}            {"status": "idle"}
+                                 (如果被请求关机则为 "shutdown")
+```
+
+### 4.3 spawn 实现
+
+```python
+def spawn(self, name: str, role: str, prompt: str) -> str:
+    # 1. 检查是否已存在
+    member = self._find_member(name)
+    if member:
+        if member["status"] not in ("idle", "shutdown"):
+            return f"Error: '{name}' is currently {member['status']}"
+        member["status"] = "working"  # 重新激活
+    else:
+        member = {"name": name, "role": role, "status": "working"}
+        self.config["members"].append(member)
+
+    # 2. 持久化到磁盘
+    self._save_config()
+
+    # 3. 启动守护线程
+    thread = threading.Thread(
+        target=self._teammate_loop,
+        args=(name, role, prompt),
+        daemon=True,  # 守护线程：主程序退出时自动结束
+    )
+    self.threads[name] = thread
+    thread.start()
+    return f"Spawned '{name}' (role: {role})"
+```
+
+**关键设计**：
+- 如果队友已存在且为 idle/shutdown，可以重新激活
+- 使用 `daemon=True` 确保主程序退出时线程自动终止
+- 配置立即持久化到 `config.json`
+
+### 4.4 队友的 Agent 循环
+
+```python
+def _teammate_loop(self, name: str, role: str, prompt: str):
+    sys_prompt = (
+        f"You are '{name}', role: {role}, at {WORKDIR}. "
+        f"Use send_message to communicate. Complete your task."
+    )
+    messages = [{"role": "user", "content": prompt}]
+    tools = self._teammate_tools()
+    for _ in range(50):  # 最多 50 轮
+        # 1. 检查邮箱
+        inbox = BUS.read_inbox(name)
+        for msg in inbox:
+            messages.append({"role": "user", "content": json.dumps(msg)})
+
+        # 2. 调用 LLM（源码第 176-185 行有 try/except 保护）
+        try:
+            response = client.messages.create(
+                model=MODEL, system=sys_prompt,
+                messages=messages, tools=tools, max_tokens=8000,
+            )
+        except Exception:
+            break  # LLM 调用失败（网络错误、额度耗尽等），直接跳出循环
+        messages.append({"role": "assistant", "content": response.content})
+
+        # 3. 检查是否继续
+        if response.stop_reason != "tool_use":
+            break
+
+        # 4. 执行工具
+        results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                output = self._exec(name, block.name, block.input)
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+        messages.append({"role": "user", "content": results})
+
+    # 5. 循环结束，标记为 idle
+    member = self._find_member(name)
+    if member and member["status"] != "shutdown":
+        member["status"] = "idle"
+        self._save_config()
+```
+
+**关于 `_save_config()` 的持久化风险**：`_save_config()` 的实现（源码第 136-137 行）是 `self.config_path.write_text(json.dumps(...))`，即每次调用都完整覆盖 config.json 文件。如果在写入过程中程序崩溃（如断电、进程被 kill），可能导致文件内容不完整或为空。在生产环境中，更安全的做法是"先写入临时文件，再原子重命名"（先 `write_text` 到 `.tmp` 文件，然后 `os.replace` 覆盖目标文件），以确保要么完全写入成功，要么保持旧文件不变。
+
+### 4.5 队友的工具集
+
+队友的工具集与 Lead 不同。源码第 221-236 行：
+
+**与 Lead 的工具对比**：
+
+| 工具 | Lead | Teammate |
+|------|------|----------|
+| bash / read_file / write_file / edit_file | ✅ | ✅ |
+| send_message | ✅ | ✅ |
+| read_inbox | ✅ | ✅ |
+| broadcast | ✅ | ❌ |
+| spawn_teammate | ✅ | ❌ |
+| list_teammates | ✅ | ❌ |
+
+**为什么队友不能 spawn？** 防止无限递归：alice spawn bob，bob spawn charlie，charlie spawn dave...
 
 ---
 
-## 5. 工具集成
+## 5. Lead 的 Agent 循环
 
-### 5.1 工具定义
+### 5.1 与标准循环的区别
 
-```python
-TOOLS = [
-    # ... 其他工具 ...
-    {
-        "name": "spawn",
-        "description": "创建一个新的队友",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "队友名称"
-                },
-                "role": {
-                    "type": "string",
-                    "description": "队友角色（如 coder, tester, reviewer）"
-                },
-                "prompt": {
-                    "type": "string",
-                    "description": "给队友的初始指令"
-                }
-            },
-            "required": ["name", "role", "prompt"]
-        }
-    },
-    {
-        "name": "send",
-        "description": "发送消息给队友",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "to": {"type": "string"},
-                "content": {"type": "string"}
-            },
-            "required": ["to", "content"]
-        }
-    },
-    {
-        "name": "broadcast",
-        "description": "广播消息给所有队友",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "content": {"type": "string"}
-            },
-            "required": ["content"]
-        }
-    },
-    {
-        "name": "read_inbox",
-        "description": "读取收件箱",
-        "input_schema": {
-            "type": "object",
-            "properties": {},
-            "required": []
-        }
-    },
-    {
-        "name": "list_team",
-        "description": "列出所有队友",
-        "input_schema": {
-            "type": "object",
-            "properties": {},
-            "required": []
-        }
-    },
-]
-```
-
-### 5.2 注册处理器
+Lead 的循环在标准 Agent 循环基础上增加了**邮箱检查**（源码第 344-381 行）：
 
 ```python
-TEAM_DIR = Path(".team")
-BUS = MessageBus(TEAM_DIR)
-TEAMMATES = TeammateManager(TEAM_DIR, BUS)
+def agent_loop(messages: list):
+    while True:
+        # 1. 每轮循环前检查邮箱
+        inbox = BUS.read_inbox("lead")
+        if inbox:
+            messages.append({
+                "role": "user",
+                "content": f"<inbox>{json.dumps(inbox, indent=2)}</inbox>",
+            })
+            messages.append({
+                "role": "assistant",
+                "content": "Noted inbox messages.",
+            })
 
-TOOL_HANDLERS = {
-    # ... 其他工具 ...
-    "spawn": lambda **kw: TEAMMATES.spawn(
-        kw["name"],
-        kw["role"],
-        kw["prompt"]
-    ),
-    "send": lambda **kw: BUS.send("lead", kw["to"], kw["content"]),
-    "broadcast": lambda **kw: BUS.broadcast("lead", kw["content"]),
-    "read_inbox": lambda **kw: BUS.read_inbox("lead"),
-    "list_team": lambda **kw: TEAMMATES.list_all(),
-}
+        # 2. 标准 LLM 调用 + 工具执行（与 s01 相同）
+        response = client.messages.create(...)
+        # ...
 ```
+
+**与 s01 的核心循环对比**：唯一的区别是在每轮循环开始前增加了邮箱检查和消息注入。
+
+### 5.2 交互命令
+
+源码支持两个快捷命令（第 393-397 行）：
+
+- `/team`：查看团队状态（等价于 `list_teammates()`）
+- `/inbox`：查看 Lead 的邮箱
 
 ---
 
@@ -525,41 +417,35 @@ TOOL_HANDLERS = {
 用户：创建一个开发团队，包含前端和后端开发者
 
 Lead Agent：
-  spawn(name="alice", role="前端开发", prompt="负责 React 组件开发")
-  → 队友 'alice' (角色: 前端开发) 已创建
+  spawn_teammate(name="alice", role="前端开发", prompt="负责 React 组件开发")
+  → Spawned 'alice' (role: 前端开发)
 
-  spawn(name="bob", role="后端开发", prompt="负责 API 和数据库")
-  → 队友 'bob' (角色: 后端开发) 已创建
+  spawn_teammate(name="bob", role="后端开发", prompt="负责 API 和数据库")
+  → Spawned 'bob' (role: 后端开发)
 
-  list_team()
-  → 团队成员：
-     🔄 alice (前端开发)
-     🔄 bob (后端开发)
+  list_teammates()
+  → Team: default
+    alice (前端开发): working
+    bob (后端开发): working
 ```
 
-### 6.2 团队协作
+### 6.2 消息流转示意
 
 ```
-Lead Agent：
-  send(to="bob", content="请创建用户 API")
-  → 消息已发送到 bob
-
-[Bob 的循环中]
-  检查邮箱 → 收到消息
-  思考 → 创建 API
-  执行 → write_file("api/users.py", ...)
-  完成
-  更新状态 → idle
-
-Lead Agent：
-  send(to="alice", content="用户 API 已完成，请创建前端页面")
-  → 消息已发送到 alice
-
-[Alice 的循环中]
-  检查邮箱 → 收到消息
-  思考 → 创建页面
-  执行 → write_file("src/Users.jsx", ...)
-  完成
+Lead                        Alice                      Bob
+  │                           │                          │
+  │─send_message("bob","...")─┼─────────────────────────→│
+  │                           │                          │
+  │                           │              Bob 循环中检查邮箱
+  │                           │              收到消息，执行任务
+  │                           │                          │
+  │─send_message("alice",".")→│                          │
+  │                           │                          │
+  │              Alice 循环中检查邮箱                     │
+  │              收到消息，执行任务                       │
+  │                           │                          │
+  │─read_inbox() ←────────────┤ ←─── send_message ──────┤
+  │  收到两人的完成通知          │                          │
 ```
 
 ---
@@ -571,9 +457,9 @@ Lead Agent：
 | 生命周期 | 临时（用完即弃） | 持久（持续运行） |
 | 上下文 | 每次全新 | 独立累积 |
 | 通信 | 单向（父→子） | 双向（互发消息） |
-| 状态 | 无 | 有（working/idle） |
+| 状态 | 无 | working / idle / shutdown |
 | 记忆 | 无 | 有（消息历史） |
-| 适用场景 | 临时任务 | 长期协作 |
+| 存储方式 | 无 | config.json + JSONL 邮箱 |
 
 ---
 
@@ -581,48 +467,19 @@ Lead Agent：
 
 ### Q1：队友会无限运行吗？
 
-**答案**：不会。每个队友循环有最大轮次限制（如 50 轮），之后自动转为 `idle` 状态。
+**不会**。每个队友循环有最大轮次限制（50 轮），之后自动转为 `idle` 状态。
 
-### Q2：如何停止队友？
+### Q2：如何重新激活 idle 的队友？
 
-```python
-def shutdown(self, name: str) -> str:
-    """停止队友"""
-    member = self._find_member(name)
-    if not member:
-        return f"队友不存在：{name}"
-
-    if member["status"] == "shutdown":
-        return f"队友已停止：{name}"
-
-    # 发送停止消息
-    self.bus.send("lead", name, "请停止工作", "shutdown")
-    self._update_member(name, status="shutdown")
-
-    return f"已请求停止队友：{name}"
-```
+调用 `spawn_teammate` 即可，TeammateManager 会检测到队友已存在且状态为 idle，自动重新激活。
 
 ### Q3：队友可以互相通信吗？
 
-**答案**：可以。任何队友都可以调用 `send` 工具向其他队友发送消息。
-
-```python
-# Alice 的循环中
-send(to="bob", content="API 规范已更新，请查看")
-```
+**可以**。每个队友都有 `send_message` 工具，可以向任何队友发送消息。
 
 ### Q4：如何处理消息丢失？
 
-**答案**：JSONL 的追加操作是原子的，不容易丢失。但如果需要可靠性，可以实现确认机制：
-
-```python
-# 发送时带 ID
-msg_id = str(uuid.uuid4())
-self.send(sender, to, content, extra={"msg_id": msg_id})
-
-# 接收后确认
-self.acknowledge(msg_id)
-```
+JSONL 的 append 操作是原子的，不容易丢失。但如果需要更高可靠性，可以实现确认机制（s10 会引入结构化的请求-响应协议）。
 
 ---
 
@@ -632,44 +489,25 @@ self.acknowledge(msg_id)
 
 | 要点 | 说明 |
 |------|------|
-| **持久化队友** | 持续运行，有独立上下文 |
-| **MessageBus** | JSONL 邮箱，支持双向通信 |
-| **线程隔离** | 每个队友在独立线程中运行 |
-| **状态管理** | working/idle/shutdown |
+| **持久化队友** | 持续运行在独立线程中，有独立上下文和记忆 |
+| **MessageBus** | 基于 JSONL 邮箱的异步通信，append-only + drain 模式 |
+| **config.json** | 持久化团队成员信息，支持重启后恢复 |
+| **工具隔离** | 队友不能 spawn 新队友，防止无限递归 |
 
-### 9.2 代码模板
-
-```python
-# 创建队友
-spawn(name="alice", role="coder", prompt="...")
-
-# 发送消息
-send(to="alice", content="请实现用户登录")
-
-# 广播
-broadcast(content="第一阶段完成")
-
-# 读取收件箱
-read_inbox()
-
-# 列出团队
-list_team()
-```
-
-### 9.3 关键洞察
+### 9.2 关键洞察
 
 ```
 团队的核心价值：
-1. 持久化：队友持续运行，有记忆
-2. 通信：队友之间可以互相发送消息
-3. 隔离：每个队友有独立的上下文
+1. 持久化：队友持续运行，有独立的上下文记忆
+2. 通信：通过 JSONL 邮箱实现异步消息传递
+3. 隔离：每个队友有独立的线程和消息历史
 4. 协作：可以分工完成复杂任务
 
 设计原则：
-- JSONL 邮箱：持久化消息传递
-- 独立线程：每个队友并发运行
-- 状态管理：tracking working/idle/shutdown
-- 配置文件：记录团队成员信息
+- JSONL 邮箱：append 原子性 + drain 语义
+- 守护线程：daemon=True 确保不阻塞主程序退出
+- 工具隔离：队友不含 spawn，防止递归
+- 配置持久化：config.json 跨会话记录状态
 ```
 
 ---
@@ -680,17 +518,25 @@ list_team()
 
 定义常见角色的预设模板（coder、tester、reviewer），简化队友创建。
 
+提示：可以定义一个 `ROLE_TEMPLATES` 字典，将角色名映射到预设的 role 描述和默认 prompt 模板。在 `spawn` 方法中查找模板，如果匹配则自动填充 role 和 prompt 参数。
+
 ### 练习 2：消息确认
 
-实现消息确认机制，确保消息被接收。
+实现消息确认机制，确保消息被接收和处理。
+
+提示：可以在 MessageBus 中添加 `confirm` 消息类型，发送方在消息中附带一个唯一 ID，接收方处理完后通过 `send` 回复一条带该 ID 的确认消息。发送方在 `read_inbox` 时检查是否收到对应的确认。
 
 ### 练习 3：队友发现
 
 队友可以自动发现其他队友，获取团队列表。
 
+提示：可以为队友添加一个 `list_teammates` 工具，内部调用 `TEAM.list_all()` 读取 config.json 中的成员列表。注意不要暴露 spawn 等管理能力，只提供只读查询。
+
 ### 练习 4：状态同步
 
 实现心跳机制，定期同步队友状态。
+
+提示：可以在 `_teammate_loop` 中每隔 N 轮调用一次 `_save_config()` 将当前状态写入 config.json，同时 Lead 端在 `list_teammates` 中对比内存状态与文件状态，检测"僵尸"队友（线程已退出但 config 中仍为 working）。
 
 ---
 

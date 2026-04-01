@@ -1,8 +1,8 @@
-# s12：工作树隔离 —— 完美的终点
+# s12：工作树与任务隔离 —— 完美的终点
 
-> **核心口号**：*"各自工作在自己的目录，互不干扰"*
+> **核心口号**：*"隔离靠目录，协调靠任务 ID"*
 
-> **学习目标**：理解执行隔离的必要性，掌握 Git Worktree 机制，学会完整的事件流
+> **学习目标**：理解执行隔离的必要性，掌握 Git Worktree 机制，学会完整的事件流追踪。
 
 ---
 
@@ -10,10 +10,10 @@
 
 完成本章后，你将能够：
 
-1. **理解隔离的价值** —— 为什么需要独立的执行环境
-2. **掌握 Git Worktree** —— 创建隔离的工作目录
-3. **实现任务-工作树绑定** —— 任务与目录的关联
-4. **设计事件流** —— 完整的生命周期追踪
+1. **理解隔离的价值** —— 为什么共享目录在并行任务中会产生冲突
+2. **掌握 Git Worktree** —— 用 Git 原生能力创建隔离的工作目录
+3. **实现任务-工作树绑定** —— 任务（控制面）与工作树（执行面）的关联
+4. **设计事件流** —— 通过 append-only 日志追踪完整生命周期
 
 ---
 
@@ -33,8 +33,8 @@ uv run python agents/s12_worktree_task_isolation.py
 
 ### 本章完成标准
 
-- 能解释“共享目录冲突”与“工作树隔离”在协作稳定性上的差异。
-- 能独立完成“创建工作树 → 绑定任务 → 执行命令 → 移除回收”流程。
+- 能解释"共享目录冲突"与"工作树隔离"在协作稳定性上的差异。
+- 能独立完成"创建工作树 -> 绑定任务 -> 执行命令 -> 保留/移除回收"流程。
 - 能说清事件流在审计与故障恢复中的价值。
 
 ---
@@ -43,7 +43,7 @@ uv run python agents/s12_worktree_task_isolation.py
 
 ### 1.1 共享目录的问题
 
-在 s11 中，多个队友自主认领任务：
+在 s11 中，多个队友自主认领任务，但所有人在同一个目录下工作：
 
 ```
 工作目录: /workspace/
@@ -59,11 +59,12 @@ Bob (认领任务 #2: 同时修改 auth.py):
 结果: Bob 的修改覆盖了 Alice 的修改！
 ```
 
-**问题**：
+**问题根因**：
+
 1. **文件冲突**：多人同时修改同一文件
 2. **状态污染**：未提交的更改混在一起
-3. **难以回滚**：无法单独撤销某个任务
-4. **测试干扰**：一个任务的测试影响另一个
+3. **难以回滚**：无法单独撤销某个任务的修改
+4. **测试干扰**：一个任务的测试影响另一个任务的运行
 
 ### 1.2 理想的隔离
 
@@ -85,21 +86,23 @@ Bob (认领任务 #2: 同时修改 auth.py):
 Alice 和 Bob 在完全独立的目录中工作，互不干扰！
 ```
 
+核心思想：**任务（控制面）管理工作目标，工作树（执行面）管理实际操作。通过 task_id 将两者绑定。**
+
 ---
 
 ## 2. Git Worktree 基础
 
 ### 2.1 什么是 Worktree
 
-Git Worktree 允许同一仓库的多个检出版本：
+Git Worktree 允许在同一仓库下检出多个工作目录，每个目录有独立的分支和文件状态：
 
 ```bash
-# 创建新的 worktree
+# 创建新的 worktree（基于 HEAD 创建分支 wt/auth-refactor）
 git worktree add .worktrees/auth-refactor -b wt/auth-refactor HEAD
 
 # 目录结构：
-# main/           ← 主工作树
-# .worktrees/auth-refactor/  ← 新工作树
+# main/           <-- 主工作树
+# .worktrees/auth-refactor/  <-- 新工作树
 #   └── .git 文件指向 main/.git/worktrees/auth-refactor/
 
 # 列出所有 worktree
@@ -107,364 +110,413 @@ git worktree list
 
 # 删除 worktree
 git worktree remove .worktrees/auth-refactor
+
+# 强制删除（有未提交更改时）
+git worktree remove --force .worktrees/auth-refactor
 ```
 
 ### 2.2 Worktree 的优势
 
 | 特性 | 说明 |
 |------|------|
-| **隔离** | 完全独立的文件副本 |
-| **共享历史** | 共享 .git 目录，节省空间 |
+| **隔离** | 完全独立的文件副本，互不干扰 |
+| **共享历史** | 共享 .git 目录，节省磁盘空间 |
 | **独立分支** | 每个 worktree 有自己的分支 |
 | **原子操作** | Git 原生支持，安全可靠 |
+| **快速创建** | 硬链接方式，创建速度极快 |
+
+### 2.3 仓库根目录检测
+
+源码中使用 `detect_repo_root` 函数自动定位仓库根目录：
+
+```python
+def detect_repo_root(cwd: Path) -> Path | None:
+    """通过 git rev-parse --show-toplevel 检测仓库根目录"""
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if r.returncode != 0:
+            return None
+        root = Path(r.stdout.strip())
+        return root if root.exists() else None
+    except Exception:
+        return None
+
+REPO_ROOT = detect_repo_root(WORKDIR) or WORKDIR
+```
+
+如果不在 Git 仓库中，回退到当前工作目录。后续 `.tasks` 和 `.worktrees` 目录都基于 `REPO_ROOT` 创建。
 
 ---
 
-## 3. 工作树管理器
+## 3. 三大核心组件
 
-### 3.1 核心类
+源码中 s12 的架构由三个核心类组成，各司其职：
+
+```
+TaskManager    ── 控制面：管理任务的生命周期
+EventBus       ── 观测面：记录所有事件的 append-only 日志
+WorktreeManager ── 执行面：管理 Git Worktree 的创建、执行、销毁
+```
+
+### 3.1 EventBus：事件总线
+
+EventBus 是一个 append-only 的事件日志，记录所有生命周期事件，提供可观测性。
 
 ```python
-import json
-import subprocess
-import time
-from pathlib import Path
-from typing import Dict, Optional
+class EventBus:
+    def __init__(self, event_log_path: Path):
+        self.path = event_log_path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.path.exists():
+            self.path.write_text("")
 
+    def emit(
+        self,
+        event: str,
+        task: dict | None = None,
+        worktree: dict | None = None,
+        error: str | None = None,
+    ):
+        payload = {
+            "event": event,
+            "ts": time.time(),
+            "task": task or {},
+            "worktree": worktree or {},
+        }
+        if error:
+            payload["error"] = error
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload) + "\n")
+
+    def list_recent(self, limit: int = 20) -> str:
+        # 读取最后 N 条事件（最多 200 条）
+        ...
+```
+
+**事件类型一览**（从源码中实际使用的全部事件）：
+
+| 事件名 | 触发时机 | 携带数据 |
+|--------|---------|---------|
+| `worktree.create.before` | 创建工作树之前 | task.id, worktree.name, worktree.base_ref |
+| `worktree.create.after` | 创建工作树成功之后 | task.id, worktree.name/path/branch/status |
+| `worktree.create.failed` | 创建工作树失败 | task.id, worktree.name, error |
+| `worktree.remove.before` | 移除工作树之前 | task.id, worktree.name/path |
+| `worktree.remove.after` | 移除工作树成功之后 | task.id, worktree.name/path/status |
+| `worktree.remove.failed` | 移除工作树失败 | task.id, worktree.name, error |
+| `worktree.keep` | 标记保留工作树时 | task.id, worktree.name/path/status |
+| `task.completed` | 移除工作树时完成任务 | task.id/subject/status, worktree.name |
+
+事件存储在 `.worktrees/events.jsonl` 文件中，每行一个 JSON 对象。
+
+### 3.2 TaskManager：任务管理器
+
+TaskManager 管理任务的生命周期，每个任务存储为 `.tasks/task_{id}.json` 文件。
+
+```python
+class TaskManager:
+    def __init__(self, tasks_dir: Path):
+        self.dir = tasks_dir
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self._next_id = self._max_id() + 1
+```
+
+**任务数据结构**：
+
+```json
+{
+  "id": 1,
+  "subject": "实现认证重构",
+  "description": "",
+  "status": "pending",
+  "owner": "",
+  "worktree": "",
+  "blockedBy": [],
+  "created_at": 1730000000.0,
+  "updated_at": 1730000000.0
+}
+```
+
+**关键方法**：
+
+| 方法 | 功能 |
+|------|------|
+| `create(subject, description)` | 创建新任务，status 默认 "pending" |
+| `get(task_id)` | 获取任务详情 |
+| `update(task_id, status, owner)` | 更新任务状态或 owner |
+| `bind_worktree(task_id, worktree, owner)` | 绑定任务到工作树，pending 自动转为 in_progress |
+| `unbind_worktree(task_id)` | 解除工作树绑定（将 worktree 置空） |
+| `list_all()` | 列出所有任务 |
+
+`bind_worktree` 是绑定逻辑的关键：它将 `task["worktree"]` 设为工作树名称。如果任务当前状态为 `pending`，自动将其转为 `in_progress`。
+
+### 3.3 WorktreeManager：工作树管理器
+
+WorktreeManager 是本章的核心，负责 Git Worktree 的创建、执行和销毁。
+
+```python
 class WorktreeManager:
-    def __init__(self, worktrees_dir: Path, tasks_manager):
-        self.dir = worktrees_dir
-        self.dir.mkdir(exist_ok=True)
-        self.tasks = tasks_manager
-
-        # 索引文件
+    def __init__(self, repo_root: Path, tasks: TaskManager, events: EventBus):
+        self.repo_root = repo_root
+        self.tasks = tasks
+        self.events = events
+        self.dir = repo_root / ".worktrees"
+        self.dir.mkdir(parents=True, exist_ok=True)
         self.index_path = self.dir / "index.json"
-        self.index = self._load_index()
-
-        # 事件流
-        self.events_path = self.dir / "events.jsonl"
-
-    def _load_index(self) -> Dict:
-        """加载工作树索引"""
-        if self.index_path.exists():
-            return json.loads(self.index_path.read_text(encoding="utf-8"))
-        return {"worktrees": {}}
-
-    def _save_index(self):
-        """保存索引"""
-        self.index_path.write_text(
-            json.dumps(self.index, indent=2, ensure_ascii=False),
-            encoding="utf-8"
-        )
-
-    def _emit_event(self, event_type: str, data: Dict):
-        """写入事件流"""
-        event = {
-            "event": event_type,
-            "timestamp": int(time.time()),
-            **data
-        }
-        with open(self.events_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(event, ensure_ascii=False) + "\n")
-
-    def _run_git(self, args: list) -> str:
-        """运行 Git 命令"""
-        result = subprocess.run(
-            ["git"] + args,
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        return result.stdout.strip()
+        # 初始化索引
+        if not self.index_path.exists():
+            self.index_path.write_text(json.dumps({"worktrees": []}, indent=2))
+        self.git_available = self._is_git_repo()
 ```
 
-### 3.2 创建工作树
+**索引数据结构**（存储在 `.worktrees/index.json`）：
+
+```json
+{
+  "worktrees": [
+    {
+      "name": "auth-refactor",
+      "path": "/path/to/.worktrees/auth-refactor",
+      "branch": "wt/auth-refactor",
+      "task_id": 1,
+      "status": "active",
+      "created_at": 1730000000.0
+    }
+  ]
+}
+```
+
+注意：索引中的 `worktrees` 是一个**数组**（不是字典），通过 `_find(name)` 方法按 name 查找。
+
+#### 3.3.1 名称校验
 
 ```python
-def create(
-    self,
-    name: str,
-    task_id: Optional[int] = None,
-    branch: Optional[str] = None
-) -> str:
-    """创建新工作树"""
-    if name in self.index["worktrees"]:
-        return f"工作树 '{name}' 已存在"
-
-    # 创建分支名
-    if branch is None:
-        branch = f"wt/{name}"
-
-    # 创建工作树路径
-    worktree_path = self.dir / name
-
-    try:
-        # 使用 git worktree add
-        self._run_git([
-            "worktree", "add",
-            "-b", branch,
-            str(worktree_path),
-            "HEAD"
-        ])
-
-        # 更新索引
-        self.index["worktrees"][name] = {
-            "path": str(worktree_path),
-            "branch": branch,
-            "status": "active",
-            "created_at": int(time.time())
-        }
-        self._save_index()
-
-        # 绑定任务
-        if task_id is not None:
-            self._bind_task(task_id, name)
-
-        # 发出事件
-        self._emit_event("worktree.create.after", {
-            "name": name,
-            "path": str(worktree_path),
-            "branch": branch
-        })
-
-        return f"工作树 '{name}' 已创建在 {worktree_path}"
-
-    except subprocess.CalledProcessError as e:
-        return f"创建工作树失败: {e.stderr}"
-```
-
-### 3.3 任务绑定
-
-```python
-def _bind_task(self, task_id: int, worktree_name: str):
-    """绑定任务到工作树"""
-    task = self.tasks._load(task_id)
-
-    # 设置工作树
-    task["worktree"] = worktree_name
-
-    # 如果任务是 pending，自动转为 in_progress
-    if task["status"] == "pending":
-        task["status"] = "in_progress"
-
-    # 保存任务
-    self.tasks._save(task)
-
-    # 更新工作树索引
-    self.index["worktrees"][worktree_name]["task_id"] = task_id
-    self._save_index()
-
-    # 发出事件
-    self._emit_event("task.bound", {
-        "task_id": task_id,
-        "worktree": worktree_name
-    })
-
-    return f"任务 #{task_id} 绑定到工作树 '{worktree_name}'"
-```
-
-### 3.4 在工作树中执行命令
-
-```python
-def run_in_worktree(self, name: str, command: str) -> str:
-    """在工作树中执行命令"""
-    if name not in self.index["worktrees"]:
-        return f"工作树不存在: {name}"
-
-    worktree = self.index["worktrees"][name]
-    worktree_path = worktree["path"]
-
-    if worktree["status"] != "active":
-        return f"工作树 '{name}' 状态为 {worktree['status']}，无法执行"
-
-    try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            cwd=worktree_path,  # 关键：在工作树目录中执行
-            capture_output=True,
-            text=True,
-            timeout=300
+def _validate_name(self, name: str):
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,40}", name or ""):
+        raise ValueError(
+            "Invalid worktree name. Use 1-40 chars: letters, numbers, ., _, -"
         )
-        output = (result.stdout + result.stderr).strip()[:50000]
-        return output
-    except subprocess.TimeoutExpired:
-        return f"命令超时"
-    except Exception as e:
-        return f"执行失败: {str(e)}"
 ```
 
-**准确性补充**：
-- 示例里使用 `shell=True` 是为了教学简化命令拼接。
-- 在生产环境中，优先使用参数数组方式调用命令，并对命令白名单做限制，避免命令注入风险。
+工作树名称只允许 ASCII 字符（字母、数字、点、下划线、连字符），长度 1-40 字符。**不支持中文、空格或其他 Unicode 字符**。这意味着类似 `认证重构`、`task #1`、`my worktree` 这样的名称都会被拒绝：
 
-### 3.5 保留和移除
+```
+# 以下名称会触发 ValueError：
+"认证重构"        # 包含中文字符
+"task #1"        # 包含空格和 #
+"my worktree"    # 包含空格
+"任务_重构"       # 包含中文字符
+"tree/v1"        # 包含斜杠 /
+
+# 以下名称合法：
+"auth-refactor"   # 字母 + 连字符
+"task_1"          # 字母 + 下划线 + 数字
+"v2.0.fix"        # 字母 + 点 + 数字
+```
+
+这一限制源于两个层面：正则表达式 `[A-Za-z0-9._-]` 只匹配 ASCII 子集；同时工作树名称会被直接用作目录名和 Git 分支名（`wt/{name}`），分支名中包含特殊字符可能导致 Git 命令失败。
+
+#### 3.3.2 创建工作树
+
+```python
+def create(self, name: str, task_id: int = None, base_ref: str = "HEAD") -> str:
+    self._validate_name(name)
+    # 检查重名
+    if self._find(name):
+        raise ValueError(f"Worktree '{name}' already exists in index")
+    # 检查任务是否存在
+    if task_id is not None and not self.tasks.exists(task_id):
+        raise ValueError(f"Task {task_id} not found")
+
+    path = self.dir / name
+    branch = f"wt/{name}"
+
+    # 发出 before 事件
+    self.events.emit("worktree.create.before", ...)
+
+    # 执行 git worktree add
+    self._run_git(["worktree", "add", "-b", branch, str(path), base_ref])
+
+    # 写入索引
+    entry = { "name": name, "path": str(path), "branch": branch,
+              "task_id": task_id, "status": "active", "created_at": time.time() }
+
+    # 绑定任务（如果提供了 task_id）
+    if task_id is not None:
+        self.tasks.bind_worktree(task_id, name)
+
+    # 发出 after 事件
+    self.events.emit("worktree.create.after", ...)
+```
+
+关键实现细节：
+- 分支名自动生成为 `wt/{name}`
+- `base_ref` 参数默认为 `"HEAD"`，可以指定其他 Git 引用（如某个 commit hash 或 tag）
+- 创建失败时发出 `worktree.create.failed` 事件并向上抛出异常
+
+#### 3.3.3 在工作树中执行命令
+
+```python
+def run(self, name: str, command: str) -> str:
+    # 危险命令拦截
+    dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
+    if any(d in command for d in dangerous):
+        return "Error: Dangerous command blocked"
+
+    wt = self._find(name)
+    path = Path(wt["path"])
+
+    r = subprocess.run(
+        command,
+        shell=True,          # 使用 shell 执行
+        cwd=path,            # 关键：在工作树目录中执行
+        capture_output=True,
+        text=True,
+        timeout=300,         # 5 分钟超时
+    )
+    out = (r.stdout + r.stderr).strip()
+    return out[:50000] if out else "(no output)"
+```
+
+关键实现细节：
+- 使用 `shell=True` 执行命令，支持管道等 shell 特性
+- `cwd=path` 确保命令在目标工作树目录中运行
+- 超时 300 秒（5 分钟）
+- 输出截断到 50000 字符
+- 内置危险命令黑名单：`rm -rf /`、`sudo`、`shutdown`、`reboot`、`> /dev/`
+
+> **安全提示**：`shell=True` 存在命令注入风险。在教学代码中为了简化命令拼接而使用。在生产环境中，推荐使用参数数组方式调用命令，并对可执行命令建立白名单。
+
+#### 3.3.4 保留工作树
 
 ```python
 def keep(self, name: str) -> str:
-    """保留工作树（标记为 kept）"""
-    if name not in self.index["worktrees"]:
-        return f"工作树不存在: {name}"
-
-    self.index["worktrees"][name]["status"] = "kept"
-    self._save_index()
-
-    self._emit_event("worktree.keep", {
-        "name": name
-    })
-
-    return f"工作树 '{name}' 已标记为保留"
-
-def remove(
-    self,
-    name: str,
-    force: bool = False,
-    complete_task: bool = False
-) -> str:
-    """移除工作树"""
-    if name not in self.index["worktrees"]:
-        return f"工作树不存在: {name}"
-
-    worktree = self.index["worktrees"][name]
-    worktree_path = worktree["path"]
-
-    # 发出事件
-    self._emit_event("worktree.remove.before", {
-        "name": name,
-        "path": worktree_path
-    })
-
-    try:
-        # 移除 Git worktree
-        self._run_git(["worktree", "remove", str(worktree_path)])
-
-        # 完成绑定的任务
-        if complete_task and worktree.get("task_id"):
-            task_id = worktree["task_id"]
-
-            # 更新任务状态
-            self.tasks.update(task_id, status="completed")
-
-            # 解除绑定
-            task = self.tasks._load(task_id)
-            task["worktree"] = ""
-            self.tasks._save(task)
-
-            # 发出事件
-            self._emit_event("task.completed", {
-                "task_id": task_id,
-                "worktree": name
-            })
-
-        # 从索引中移除
-        del self.index["worktrees"][name]
-        self._save_index()
-
-        # 发出事件
-        self._emit_event("worktree.remove.after", {
-            "name": name,
-            "path": worktree_path
-        })
-
-        return f"工作树 '{name}' 已移除"
-
-    except subprocess.CalledProcessError as e:
-        return f"移除工作树失败: {e.stderr}"
+    # 在索引中将 status 设为 "kept"
+    item["status"] = "kept"
+    item["kept_at"] = time.time()
+    # 发出 worktree.keep 事件
+    self.events.emit("worktree.keep", ...)
 ```
+
+`keep` 的语义：工作树保留在磁盘上，但标记为 "kept" 状态，表示任务已完成但需要保留工作成果供后续查看。
+
+#### 3.3.5 移除工作树
+
+```python
+def remove(self, name: str, force: bool = False, complete_task: bool = False) -> str:
+    # 发出 before 事件
+    self.events.emit("worktree.remove.before", ...)
+
+    # 执行 git worktree remove（force 时添加 --force 参数）
+    args = ["worktree", "remove"]
+    if force:
+        args.append("--force")
+    args.append(wt["path"])
+    self._run_git(args)
+
+    # 可选：完成绑定的任务
+    if complete_task and wt.get("task_id") is not None:
+        self.tasks.update(task_id, status="completed")
+        self.tasks.unbind_worktree(task_id)
+        self.events.emit("task.completed", ...)
+
+    # 在索引中将状态设为 "removed"（不从数组中删除，而是标记）
+    item["status"] = "removed"
+    item["removed_at"] = time.time()
+
+    # 发出 after 事件
+    self.events.emit("worktree.remove.after", ...)
+```
+
+关键实现细节：
+- `force=True` 时传递 `--force` 参数给 git，允许移除有未提交更改的工作树
+- `complete_task=True` 时，同时将绑定的任务状态更新为 "completed"，并解除绑定
+- 移除后索引中的条目**不会被删除**，而是将 status 标记为 "removed" 并记录 removed_at 时间戳
+- 失败时发出 `worktree.remove.failed` 事件
+
+#### 3.3.6 Git 命令封装
+
+```python
+def _run_git(self, args: list[str]) -> str:
+    if not self.git_available:
+        raise RuntimeError("Not in a git repository. worktree tools require git.")
+    r = subprocess.run(
+        ["git", *args],
+        cwd=self.repo_root,       # 在仓库根目录执行
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if r.returncode != 0:
+        msg = (r.stdout + r.stderr).strip()
+        raise RuntimeError(msg or f"git {' '.join(args)} failed")
+    return (r.stdout + r.stderr).strip() or "(no output)"
+```
+
+所有 git 命令都在 `self.repo_root`（仓库根目录）下执行，超时 120 秒。初始化时通过 `_is_git_repo()` 检测是否在 Git 仓库中，如果不是则所有 worktree 操作会抛出异常。
 
 ---
 
 ## 4. 工具集成
 
-### 4.1 工具定义
+### 4.1 完整工具清单
+
+源码注册了以下工具（除基础文件操作工具外）：
+
+**任务管理工具**：
+
+| 工具名 | 功能 | 必填参数 |
+|--------|------|---------|
+| `task_create` | 创建新任务 | subject |
+| `task_list` | 列出所有任务 | （无） |
+| `task_get` | 获取任务详情 | task_id |
+| `task_update` | 更新任务状态或 owner | task_id |
+| `task_bind_worktree` | 手动绑定任务到工作树 | task_id, worktree |
+
+**工作树管理工具**：
+
+| 工具名 | 功能 | 必填参数 |
+|--------|------|---------|
+| `worktree_create` | 创建工作树，可选绑定任务 | name |
+| `worktree_list` | 列出索引中的所有工作树 | （无） |
+| `worktree_status` | 查看某个工作树的 git status | name |
+| `worktree_run` | 在工作树中执行命令 | name, command |
+| `worktree_remove` | 移除工作树 | name |
+| `worktree_keep` | 标记工作树为保留 | name |
+| `worktree_events` | 查看最近的生命周期事件 | （可选 limit） |
+
+### 4.2 工具处理器注册
 
 ```python
-TOOLS.extend([
-    {
-        "name": "worktree_create",
-        "description": "创建新的工作树",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string"},
-                "task_id": {"type": "integer"},
-                "branch": {"type": "string"}
-            },
-            "required": ["name"]
-        }
-    },
-    {
-        "name": "worktree_run",
-        "description": "在工作树中执行命令",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "worktree": {"type": "string"},
-                "command": {"type": "string"}
-            },
-            "required": ["worktree", "command"]
-        }
-    },
-    {
-        "name": "worktree_keep",
-        "description": "保留工作树",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string"}
-            },
-            "required": ["name"]
-        }
-    },
-    {
-        "name": "worktree_remove",
-        "description": "移除工作树",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string"},
-                "force": {"type": "boolean"},
-                "complete_task": {"type": "boolean"}
-            },
-            "required": ["name"]
-        }
-    },
-    {
-        "name": "worktree_list",
-        "description": "列出所有工作树",
-        "input_schema": {
-            "type": "object",
-            "properties": {},
-            "required": []
-        }
-    },
-])
-```
-
-### 4.2 注册处理器
-
-```python
-WORKTREES = WorktreeManager(Path(".worktrees"), TASKS)
-
-TOOL_HANDLERS.update({
-    "worktree_create": lambda **kw: WORKTREES.create(
-        kw["name"],
-        kw.get("task_id"),
-        kw.get("branch")
-    ),
-    "worktree_run": lambda **kw: WORKTREES.run_in_worktree(
-        kw["worktree"],
-        kw["command"]
-    ),
+TOOL_HANDLERS = {
+    # 基础工具
+    "bash": lambda **kw: run_bash(kw["command"]),
+    "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
+    "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
+    "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    # 任务工具
+    "task_create": lambda **kw: TASKS.create(kw["subject"], kw.get("description", "")),
+    "task_list": lambda **kw: TASKS.list_all(),
+    "task_get": lambda **kw: TASKS.get(kw["task_id"]),
+    "task_update": lambda **kw: TASKS.update(kw["task_id"], kw.get("status"), kw.get("owner")),
+    "task_bind_worktree": lambda **kw: TASKS.bind_worktree(kw["task_id"], kw["worktree"], kw.get("owner", "")),
+    # 工作树工具
+    "worktree_create": lambda **kw: WORKTREES.create(kw["name"], kw.get("task_id"), kw.get("base_ref", "HEAD")),
+    "worktree_list": lambda **kw: WORKTREES.list_all(),
+    "worktree_status": lambda **kw: WORKTREES.status(kw["name"]),
+    "worktree_run": lambda **kw: WORKTREES.run(kw["name"], kw["command"]),
     "worktree_keep": lambda **kw: WORKTREES.keep(kw["name"]),
-    "worktree_remove": lambda **kw: WORKTREES.remove(
-        kw["name"],
-        kw.get("force", False),
-        kw.get("complete_task", False)
-    ),
-    "worktree_list": lambda **kw: json.dumps(WORKTREES.index, indent=2),
-})
+    "worktree_remove": lambda **kw: WORKTREES.remove(kw["name"], kw.get("force", False), kw.get("complete_task", False)),
+    "worktree_events": lambda **kw: EVENTS.list_recent(kw.get("limit", 20)),
+}
 ```
+
+注意 `worktree_create` 支持三个参数：`name`（必填）、`task_id`（可选）、`base_ref`（可选，默认 "HEAD"）。
 
 ---
 
@@ -476,130 +528,144 @@ TOOL_HANDLERS.update({
 Lead:
   # 创建任务
   task_create(subject="重构认证模块")
-  → task #1
+  -> task #1（status: pending）
 
   # 创建工作树并绑定任务
   worktree_create(name="auth-refactor", task_id=1)
-  → 工作树 'auth-refactor' 已创建
-  → 任务 #1 绑定到工作树，状态变为 in_progress
+  -> 工作树 'auth-refactor' 已创建在 .worktrees/auth-refactor
+  -> 任务 #1 绑定到工作树，状态自动变为 in_progress
 
-[Alice 认领任务后]
-  # 在工作树中工作
-  worktree_run(worktree="auth-refactor", command="git status")
-  → On branch wt/auth-refactor
-  → Changes not staged...
+[Alice 在工作树中工作]
+  # 查看工作树状态
+  worktree_status(name="auth-refactor")
+  -> On branch wt/auth-refactor
+  -> Clean worktree
 
-  worktree_run(worktree="auth-refactor", command="vim auth.py")
-  → [编辑文件]
+  # 在工作树中执行命令
+  worktree_run(name="auth-refactor", command="vim auth.py")
+  -> [编辑文件]
 
-  worktree_run(worktree="auth-refactor", command="git add -A && git commit -m 'refactor: 重新设计认证模块'")
-  → [wt/auth-refactor 1234abc] refactor: 重新设计认证模块
+  worktree_run(name="auth-refactor", command="git add -A && git commit -m 'refactor: 重新设计认证模块'")
+  -> [wt/auth-refactor 1234abc] refactor: 重新设计认证模块
 
-  # 任务完成
+  # 任务完成，移除工作树并同时完成任务
   worktree_remove(name="auth-refactor", complete_task=true)
-  → 工作树 'auth-refactor' 已移除
-  → 任务 #1 状态更新为 completed
+  -> Removed worktree 'auth-refactor'
+  -> 任务 #1 状态更新为 completed，worktree 字段清空
 ```
 
-### 5.2 事件流
+### 5.2 keep 的工作流
+
+```
+  # 任务完成但保留工作树供审查
+  worktree_keep(name="auth-refactor")
+  -> 索引中 status 变为 "kept"，记录 kept_at 时间戳
+  -> 发出 worktree.keep 事件
+
+  # 后续手动移除
+  worktree_remove(name="auth-refactor", force=true)
+  -> Removed worktree 'auth-refactor'
+```
+
+### 5.3 事件流示例
+
+执行上述流程后，`.worktrees/events.jsonl` 中记录：
 
 ```jsonl
-{"event": "worktree.create.after", "name": "auth-refactor", "timestamp": 1730000000}
-{"event": "task.bound", "task_id": 1, "worktree": "auth-refactor", "timestamp": 1730000001}
-{"event": "task.completed", "task_id": 1, "worktree": "auth-refactor", "timestamp": 1730003600}
-{"event": "worktree.remove.before", "name": "auth-refactor", "timestamp": 1730003601}
-{"event": "worktree.remove.after", "name": "auth-refactor", "timestamp": 1730003602}
+{"event": "worktree.create.before", "ts": 1730000000.0, "task": {"id": 1}, "worktree": {"name": "auth-refactor", "base_ref": "HEAD"}}
+{"event": "worktree.create.after", "ts": 1730000001.0, "task": {"id": 1}, "worktree": {"name": "auth-refactor", "path": "...", "branch": "wt/auth-refactor", "status": "active"}}
+{"event": "worktree.remove.before", "ts": 1730003600.0, "task": {"id": 1}, "worktree": {"name": "auth-refactor", "path": "..."}}
+{"event": "task.completed", "ts": 1730003601.0, "task": {"id": 1, "subject": "重构认证模块", "status": "completed"}, "worktree": {"name": "auth-refactor"}}
+{"event": "worktree.remove.after", "ts": 1730003602.0, "task": {"id": 1}, "worktree": {"name": "auth-refactor", "path": "...", "status": "removed"}}
 ```
+
+使用 `worktree_events` 工具可以随时查看这些事件。
 
 ---
 
 ## 6. 与 s11 的对比
 
-| 方面 | s11 自主 | s12 隔离 |
-|------|----------|---------|
-| 执行环境 | 共享目录 | 独立工作树 |
-| 任务绑定 | owner 字段 | worktree + owner |
-| 冲突处理 | 无隔离 | 完全隔离 |
-| 回滚 | 困难 | Git 原生支持 |
-| 状态追踪 | 任务文件 | + 事件流 |
+| 方面 | s11 自主认领 | s12 工作树隔离 |
+|------|------------|-------------|
+| 执行环境 | 共享目录 | 独立 Git Worktree |
+| 任务绑定 | owner 字段 | worktree + owner 双重绑定 |
+| 冲突处理 | 无隔离机制 | 目录级别完全隔离 |
+| 回滚能力 | 困难 | Git 分支级别回滚 |
+| 状态追踪 | 任务文件 | 任务文件 + 事件流 |
+| 并行安全 | 不安全 | 安全（独立文件系统） |
+| 任务状态驱动 | 手动更新 | 绑定自动转 in_progress |
 
 ---
 
 ## 7. 常见问题
 
-### Q1：如何处理工作树中的未提交更改？
+### Q1：不在 Git 仓库中会怎样？
+
+源码在 `WorktreeManager.__init__` 中调用 `_is_git_repo()` 检测。如果不在 Git 仓库中，`self.git_available` 为 `False`，所有后续 worktree 操作会抛出 `RuntimeError("Not in a git repository. worktree tools require git.")`。任务管理功能不受影响。
+
+**降级方案**：如果你需要在非 Git 环境中实现类似的隔离效果，可以采用"子目录方案"作为降级策略——在主工作目录下创建独立的子目录作为隔离的工作空间，手动复制所需文件到子目录中，完成后将结果复制回来。虽然缺少 Git 的分支管理和硬链接效率，但在文件级别仍能实现基本的隔离：
 
 ```python
-def remove(self, name: str, force: bool = False, ...):
-    worktree = self.index["worktrees"][name]
-    worktree_path = worktree["path"]
-
-    # 检查是否有未提交的更改
-    if not force:
-        result = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=worktree_path,
-            capture_output=True,
-            text=True
-        )
-        if result.stdout.strip():
-            return f"工作树有未提交的更改，使用 force=true 强制删除"
-
-    # 移除工作树
-    ...
+# 降级方案的简化实现思路
+def create_isolated_dir(name: str) -> str:
+    """在非 Git 环境下创建隔离目录"""
+    isolated_dir = Path(".workspaces") / name
+    isolated_dir.mkdir(parents=True, exist_ok=True)
+    # 复制必要的源文件到隔离目录
+    import shutil
+    for f in Path(".").glob("*.py"):
+        shutil.copy2(f, isolated_dir / f.name)
+    return str(isolated_dir)
 ```
 
-### Q2：如何恢复崩溃后的状态？
+不过在实际项目中，建议始终在 Git 仓库中工作，以获得完整的版本控制和 worktree 支持。
+
+### Q2：工作树有未提交的更改能移除吗？
+
+默认不能。需要传入 `force=True`，这会在 git 命令中添加 `--force` 参数：
 
 ```python
-def recover(self) -> str:
-    """从索引恢复状态"""
-    recovered = []
-
-    for name, worktree in self.index["worktrees"].items():
-        if worktree["status"] == "active":
-            # 检查工作树是否仍然存在
-            if not Path(worktree["path"]).exists():
-                # 工作树丢失，标记为失效
-                worktree["status"] = "lost"
-                recovered.append(f"{name}: 标记为丢失")
-            else:
-                recovered.append(f"{name}: 正常")
-
-    self._save_index()
-    return "\n".join(recovered)
+# force=False 时 git 会拒绝移除有更改的工作树
+# force=True 时传递 --force 参数
+args = ["worktree", "remove"]
+if force:
+    args.append("--force")
+args.append(wt["path"])
+self._run_git(args)
 ```
 
-### Q3：多个队友可以使用同一工作树吗？
+### Q3：remove 和 keep 有什么区别？
 
-**答案**：不推荐。每个任务应该有自己的工作树。如果需要协作，使用分支而不是工作树。
+- **remove**：执行 `git worktree remove` 删除磁盘上的工作树目录，索引中标记 status 为 "removed"
+- **keep**：不删除工作树，只在索引中将 status 标记为 "kept"，保留工作成果供后续审查
 
-### Q4：如何限制工作树数量？
+### Q4：如何查看某个工作树的 Git 状态？
+
+使用 `worktree_status` 工具，它在工作树目录下执行 `git status --short --branch`：
 
 ```python
-MAX_ACTIVE_WORKTREES = 10
-
-def create(self, name: str, ...) -> str:
-    # 检查活动工作树数量
-    active = sum(
-        1 for wt in self.index["worktrees"].values()
-        if wt["status"] == "active"
+def status(self, name: str) -> str:
+    wt = self._find(name)
+    path = Path(wt["path"])
+    r = subprocess.run(
+        ["git", "status", "--short", "--branch"],
+        cwd=path,
+        ...
     )
-
-    if active >= MAX_ACTIVE_WORKTREES:
-        return f"活动工作树已达上限 ({MAX_ACTIVE_WORKTREES})"
-
-    # 继续创建...
+    return text or "Clean worktree"
 ```
 
 ### Q5：`shell=True` 会有安全风险吗？
 
-**答案**：有风险，尤其当命令包含用户输入时。推荐做法：
+有风险。源码中有两层防护：
 
-1. 优先使用参数数组，不拼接原始字符串。
-2. 对可执行命令建立白名单。
-3. 为执行目录和超时时间设置硬限制。
-4. 记录命令执行事件，便于审计与追踪。
+1. **危险命令黑名单**：拦截 `rm -rf /`、`sudo`、`shutdown`、`reboot`、`> /dev/` 等命令
+2. **超时限制**：300 秒超时，防止长时间运行的命令
+
+但黑名单方式无法覆盖所有危险命令。在生产环境中推荐：
+- 优先使用参数数组方式调用命令
+- 对可执行命令建立白名单
+- 记录命令执行事件，便于审计
 
 ---
 
@@ -609,41 +675,46 @@ def create(self, name: str, ...) -> str:
 
 | 要点 | 说明 |
 |------|------|
-| **Git Worktree** | 隔离的执行环境 |
-| **任务绑定** | 任务与工作树关联 |
-| **状态管理** | active/kept/removed |
-| **事件流** | 完整的生命周期追踪 |
+| **双面架构** | 任务是控制面，工作树是执行面，通过 task_id 绑定 |
+| **Git Worktree** | 用 Git 原生能力实现目录级隔离 |
+| **状态机** | active -> kept / removed，pending -> in_progress（自动） |
+| **事件流** | append-only 日志记录完整生命周期，提供可观测性 |
+| **索引持久化** | `.worktrees/index.json` 记录所有工作树元数据 |
+| **安全防护** | 名称校验、危险命令拦截、超时保护 |
 
 ### 8.2 工作流模板
 
-```python
+```
 # 1. 创建任务
 task_create(subject="任务描述")
 
-# 2. 创建工作树并绑定
+# 2. 创建工作树并绑定（自动将任务变为 in_progress）
 worktree_create(name="task-name", task_id=1)
 
 # 3. 在工作树中工作
-worktree_run(worktree="task-name", command="...")
+worktree_run(name="task-name", command="...")
 
-# 4. 完成
+# 4a. 完成：移除工作树 + 完成任务
 worktree_remove(name="task-name", complete_task=true)
+
+# 4b. 或保留工作树供审查
+worktree_keep(name="task-name")
 ```
 
 ### 8.3 关键洞察
 
 ```
 工作树隔离的核心价值：
-1. 完全隔离：独立的文件副本
-2. 安全操作：Git 原生支持
+1. 完全隔离：独立的文件副本，互不干扰
+2. 安全操作：Git 原生支持，稳定可靠
 3. 易于回滚：分支级别的版本控制
-4. 可追踪：完整的事件流
+4. 可观测：完整的事件流追踪
 
 设计原则：
-- 任务管理目标
-- 工作树管理执行
-- 通过 ID 绑定
-- 事件记录生命周期
+- 任务管理目标（控制面）
+- 工作树管理执行（执行面）
+- 通过 task ID 绑定
+- 事件记录完整生命周期
 ```
 
 ---
@@ -678,39 +749,41 @@ worktree_remove(name="task-name", complete_task=true)
 
 ### 你现在已经能够：
 
-1. ✅ 从零构建一个完整的 AI 编程 Agent
-2. ✅ 设计多层次的工具系统
-3. ✅ 实现上下文压缩和知识管理
-4. ✅ 构建持久化的任务系统
-5. ✅ 创建多 Agent 协作团队
-6. ✅ 实现完全隔离的执行环境
+1. 从零构建一个完整的 AI 编程 Agent
+2. 设计多层次的工具系统
+3. 实现上下文压缩和知识管理
+4. 构建持久化的任务系统
+5. 创建多 Agent 协作团队
+6. 实现完全隔离的执行环境
 
 ### 下一步建议
 
-1. **实践**：运行 `agents/s_full.py`，观察完整系统
-2. **扩展**：添加新的工具和技能
-3. **优化**：根据实际需求调整参数和策略
-4. **分享**：将你的改进贡献给社区
+1. **阅读整合源码**：运行 `agents/s_full.py`，观察 12 章全部能力的整合运行效果。对照源码，理解各模块如何在同一个 Agent 循环中协同工作。
+2. **扩展工具系统**：尝试添加新的自定义工具（如 `web_search`、`database_query`），实践 s02 中学到的工具注册和处理器模式。
+3. **研究 MCP 协议**：Model Context Protocol（模型上下文协议）是 Anthropic 推出的标准工具协议。了解 MCP 如何让 Agent 动态发现和使用外部工具，以及它与本教程中硬编码工具列表的区别。
+4. **优化上下文策略**：结合 s05 的技能系统和 s06 的压缩策略，为你的 Agent 设计一套完整的知识管理和上下文管理方案。
+5. **实践多 Agent 协作**：使用 s09-s12 的知识，构建一个能自动分配任务、隔离执行、合并结果的多 Agent 团队。
+6. **分享改进**：将你的改进贡献给社区，或在个人项目中应用这些技术。
 
 ---
 
 ## 10. 练习
 
-### 练习 1：工作树模板
+### 练习 1：工作树状态看板
 
-创建工作树模板，新工作树自动包含特定文件。
+创建一个 `worktree_dashboard` 工具，汇总展示所有工作树的状态、绑定任务、最近事件。
 
 ### 练习 2：工作树合并
 
-实现工作树合并功能，将完成的工作树合并回主分支。
+实现工作树合并功能：将完成的工作树分支合并回主分支，然后自动移除工作树。
 
-### 练习 3：资源限制
+### 练习 3：事件查询增强
 
-实现工作树的资源限制（磁盘空间、文件数量等）。
+给 EventBus 添加按事件类型、时间范围过滤的能力，支持 `worktree_events(event_type="worktree.create.after", since=1730000000)` 这样的查询。
 
-### 练习 4：事件查询
+### 练习 4：并行执行
 
-添加事件查询工具，支持按类型、时间范围过滤事件。
+实现 `run_parallel` 方法，在多个工作树中同时执行命令并收集结果（提示：使用 `subprocess.Popen` 或 `concurrent.futures`）。
 
 ---
 

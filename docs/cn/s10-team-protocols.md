@@ -11,9 +11,11 @@
 完成本章后，你将能够：
 
 1. **理解为什么需要协议** —— 自由通信的问题
-2. **掌握请求-响应模式** —— 通用的协商机制
-3. **实现状态机** —— pending → approved/rejected
-4. **应用协议到多个场景** —— 关机、计划审批等
+2. **掌握请求-响应模式** —— 通用的协商机制（request_id 关联）
+3. **理解状态跟踪器** —— `shutdown_requests` / `plan_requests` 字典 + `_tracker_lock` 线程安全
+4. **掌握关机协议的完整握手流程** —— request -> response -> 状态迁移
+5. **掌握计划审批的实际代码路径** —— plan_approval 工具 -> lead 审批 -> 通知队友
+6. **应用协议到多个场景** —— 同一个 FSM 模式，两个不同领域
 
 ---
 
@@ -28,8 +30,8 @@ uv run python agents/s10_team_protocols.py
 建议观察：
 
 1. 同一 `request_id` 如何贯穿请求与响应。
-2. `pending → approved/rejected` 状态迁移何时发生。
-3. 协议化通信如何降低“误停机、误执行”的协作风险。
+2. `pending -> approved/rejected` 状态迁移何时发生。
+3. 协议化通信如何降低"误停机、误执行"的协作风险。
 
 ---
 
@@ -37,10 +39,10 @@ uv run python agents/s10_team_protocols.py
 
 ### 1.1 自由通信的问题
 
-在 s09 中，队友可以自由发送消息：
+在 s09 中，队友可以自由发送消息，但缺乏结构化的协商机制：
 
 ```
-Lead → Bob: "请停止工作"
+Lead -> Bob: "请停止工作"
 Bob [立即停止，文件可能损坏！]
 ```
 
@@ -48,22 +50,23 @@ Bob [立即停止，文件可能损坏！]
 1. **没有协商**：Bob 可能正在写入重要文件
 2. **没有确认**：Lead 不知道 Bob 是否真的停止了
 3. **没有理由**：Bob 不知道为什么要停止
+4. **没有关联**：多个请求并发时无法区分
 
 ### 1.2 协议化的通信
 
 ```
-Lead → Bob: shutdown_request {request_id: "abc", reason: "计划变更"}
-Bob 收到请求
-Bob → Lead: shutdown_response {request_id: "abc", approve: true}
+Lead -> Bob: shutdown_request {request_id: "a1b2c3d4", reason: "计划变更"}
+Bob 收到请求，LLM 决策
+Bob -> Lead: shutdown_response {request_id: "a1b2c3d4", approve: true}
 Bob [完成当前工作，清理，退出]
 Lead [收到确认，更新状态]
 ```
 
 **改进**：
 1. **显式请求**：使用标准化的请求格式
-2. **请求 ID**：关联请求和响应
-3. **协商**：被请求者可以同意或拒绝
-4. **确认**：请求者知道结果
+2. **request_id**：关联请求和响应（UUID 前 8 位）
+3. **协商**：被请求者可以同意或拒绝（LLM 自主决策）
+4. **确认**：请求者知道最终结果
 
 ---
 
@@ -74,21 +77,21 @@ Lead [收到确认，更新状态]
 ```
 请求者                            被请求者
   │                                  │
-  │─── request {req_id, ...} ────────>│
+  │─── request {req_id, ...} ───────>│
   │                                  │
   │                    处理请求      │
   │                   做出决定       │
   │                                  │
-  │<── response {req_id, ...} ───────┤
+  │<── response {req_id, ...} ──────┤
   │                                  │
   收到结果，更新状态
 ```
 
-### 2.2 状态机
+### 2.2 状态机（FSM）
 
 ```
         ┌─────────────┐
-        │   pending   │ ◄──── 创建请求
+        │   pending   │ ◄──── 创建请求时初始化
         └──────┬──────┘
                │
       ┌────────┴────────┐
@@ -101,6 +104,23 @@ Lead [收到确认，更新状态]
 └──────────┘     └──────────┘
 ```
 
+s10 中有两个独立的状态跟踪器，各自运行同一套 FSM：
+
+| 跟踪器 | 字典变量 | 请求方 | 响应方 | 含义 |
+|--------|----------|--------|--------|------|
+| 关机协议 | `shutdown_requests` | Lead | Teammate | Lead 请求队友关机，队友决定是否同意 |
+| 计划审批 | `plan_requests` | Teammate | Lead | 队友提交计划，Lead 决定是否批准 |
+
+### 2.3 线程安全：_tracker_lock
+
+源码中所有对跟踪器字典的读写都通过 `_tracker_lock` 保护：
+
+```python
+_tracker_lock = threading.Lock()
+```
+
+这是因为 `shutdown_requests` 和 `plan_requests` 是全局字典，被多个线程（Lead 的主线程 + 各队友线程）并发访问。`_tracker_lock` 确保状态更新是原子的。
+
 ---
 
 ## 3. 关机协议
@@ -108,147 +128,190 @@ Lead [收到确认，更新状态]
 ### 3.1 问题场景
 
 ```
-场景 1：粗暴关机
-Lead → Bob: "停止！"
+场景 1：粗暴关机（s09 的局限）
+Lead -> Bob: "停止！"
 Bob [立即终止]
 结果：文件损坏，状态丢失
 
-场景 2：优雅关机
-Lead → Bob: "请停止工作"
+场景 2：优雅关机（s10 的协议）
+Lead -> Bob: shutdown_request {request_id: "a1b2c3d4"}
 Bob [完成当前文件]
-Bob [保存状态]
-Bob [通知完成]
-Lead [更新配置]
+Bob [通过 shutdown_response 工具回复 approve=True]
+Bob [循环检测 should_exit，退出线程]
+Lead [通过 shutdown_response 工具查看状态：approved]
 结果：干净退出
 ```
 
-### 3.2 协议设计
+### 3.2 源码分析：请求端（Lead）
+
+`handle_shutdown_request()` 函数（第 350-358 行）处理 Lead 发起的关机请求：
 
 ```python
-# 全局状态跟踪
-shutdown_requests = {}
+def handle_shutdown_request(teammate: str) -> str:
+    req_id = str(uuid.uuid4())[:8]          # UUID 前 8 位作为 request_id
+    with _tracker_lock:
+        shutdown_requests[req_id] = {
+            "target": teammate,             # 目标队友名
+            "status": "pending"             # 初始状态
+        }
+    BUS.send(
+        "lead", teammate,
+        "Please shut down gracefully.",     # 消息内容
+        "shutdown_request",                 # 消息类型
+        {"request_id": req_id},             # extra 字段，注入 request_id
+    )
+    return f"Shutdown request {req_id} sent to '{teammate}' (status: pending)"
+```
 
-# ========== 请求端 ==========
-def handle_shutdown_request(teammate: str, reason: str = "") -> str:
-    """发起关机请求"""
-    req_id = str(uuid.uuid4())[:8]
+**request_id 的生成**：`str(uuid.uuid4())[:8]` 取 UUID4 字符串的前 8 个字符。例如 `"a1b2c3d4-e5f6-..."` 取 `"a1b2c3d4"`。8 位十六进制提供约 40 亿种组合，在单次运行的场景下碰撞概率极低。
 
-    # 记录请求状态
-    shutdown_requests[req_id] = {
-        "target": teammate,
-        "status": "pending",
-        "reason": reason
+**实际发送的消息**（写入队友的 JSONL 文件）：
+
+```json
+{"type": "shutdown_request", "from": "lead", "content": "Please shut down gracefully.", "timestamp": 1712000000.123, "request_id": "a1b2c3d4"}
+```
+
+`request_id` 通过 `extra` 参数注入到消息对象中（`msg.update(extra)`）。
+
+### 3.3 源码分析：响应端（队友）
+
+队友的 `_exec()` 方法中处理 `shutdown_response` 工具调用（第 235-245 行）：
+
+```python
+if tool_name == "shutdown_response":
+    req_id = args["request_id"]
+    approve = args["approve"]
+    with _tracker_lock:
+        if req_id in shutdown_requests:
+            shutdown_requests[req_id]["status"] = "approved" if approve else "rejected"
+    BUS.send(
+        sender, "lead", args.get("reason", ""),
+        "shutdown_response",
+        {"request_id": req_id, "approve": approve},
+    )
+    return f"Shutdown {'approved' if approve else 'rejected'}"
+```
+
+**关键细节**：
+1. **状态更新用锁保护**：`with _tracker_lock` 确保状态更新的原子性
+2. **请求存在性检查**：`if req_id in shutdown_requests` —— 如果 request_id 不存在，静默忽略（不报错），只是不更新状态
+3. **发送确认消息给 Lead**：通过 `BUS.send()` 将决定发回 Lead 的收件箱
+
+**队友循环中的退出检测**（第 213-214 行）：
+
+```python
+if block.name == "shutdown_response" and block.input.get("approve"):
+    should_exit = True
+```
+
+当队友的 LLM 调用了 `shutdown_response(approve=True)` 时，设置 `should_exit` 标志。循环在下一次迭代开始时检查此标志并退出：
+
+```python
+if should_exit:
+    break
+```
+
+循环退出后，状态更新逻辑（第 216-219 行）：
+
+```python
+member = self._find_member(name)
+if member:
+    member["status"] = "shutdown" if should_exit else "idle"
+    self._save_config()
+```
+
+注意：如果 `should_exit=True`，最终状态是 `"shutdown"` 而非 `"idle"`。这与 s09 中无条件标记为 `"idle"` 不同。
+
+### 3.4 Lead 端查询关机状态
+
+Lead 的 `shutdown_response` 工具（注意命名，这不是队友的工具）用于查询关机请求的状态：
+
+```python
+# TOOL_HANDLERS 中的注册（第 392 行）
+"shutdown_response": lambda **kw: _check_shutdown_status(kw.get("request_id", "")),
+```
+
+```python
+def _check_shutdown_status(request_id: str) -> str:
+    with _tracker_lock:
+        return json.dumps(shutdown_requests.get(request_id, {"error": "not found"}))
+```
+
+**完整的关机握手流程**：
+
+```
+时间线：
+  t1: Lead 调用 shutdown_request(teammate="bob")
+      → 生成 req_id="a1b2c3d4"
+      → shutdown_requests["a1b2c3d4"] = {"target":"bob", "status":"pending"}
+      → 发送 shutdown_request 消息到 bob.jsonl
+
+  t2: Bob 的循环中 drain 收件箱，收到 shutdown_request 消息
+      → 消息注入 Bob 的对话历史
+      → LLM 决策：调用 shutdown_response(request_id="a1b2c3d4", approve=True)
+
+  t3: _exec() 处理 shutdown_response 工具
+      → shutdown_requests["a1b2c3d4"]["status"] = "approved"
+      → 发送 shutdown_response 消息到 lead.jsonl
+      → should_exit = True
+
+  t4: Bob 的循环下一次迭代检测 should_exit=True → break
+      → member["status"] = "shutdown"
+      → _save_config()
+
+  t5: Lead 调用 shutdown_response(request_id="a1b2c3d4")
+      → 返回 {"target":"bob", "status":"approved"}
+```
+
+### 3.5 关机工具定义
+
+**Lead 端的关机工具**（2 个）：
+
+```python
+# shutdown_request：发起关机
+{
+    "name": "shutdown_request",
+    "description": "Request a teammate to shut down gracefully. Returns a request_id for tracking.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"teammate": {"type": "string"}},
+        "required": ["teammate"]
     }
+}
 
-    # 发送请求
-    BUS.send(
-        "lead",
-        teammate,
-        reason or "请优雅地停止工作",
-        "shutdown_request",
-        {"request_id": req_id}
-    )
-
-    return f"关机请求 {req_id} 已发送给 {teammate}"
-
-# ========== 响应端 ==========
-def handle_shutdown_response(
-    sender: str,
-    request_id: str,
-    approve: bool,
-    reason: str = ""
-) -> str:
-    """处理关机响应"""
-    # 验证请求
-    if request_id not in shutdown_requests:
-        return f"未知请求 ID: {request_id}"
-
-    req = shutdown_requests[request_id]
-
-    # 验证发送者
-    if req["target"] != sender:
-        return f"请求 {request_id} 不是发送给 {sender} 的"
-
-    # 更新状态
-    req["status"] = "approved" if approve else "rejected"
-    req["response_reason"] = reason
-
-    # 发送确认
-    BUS.send(
-        "lead",
-        sender,
-        f"关机请求已{'同意' if approve else '拒绝'}",
-        "shutdown_ack",
-        {"request_id": request_id}
-    )
-
-    return f"关机请求 {request_id}: {req['status']}"
+# shutdown_response：查询状态（注意不是审批！）
+{
+    "name": "shutdown_response",
+    "description": "Check the status of a shutdown request by request_id.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"request_id": {"type": "string"}},
+        "required": ["request_id"]
+    }
+}
 ```
 
-### 3.3 队友侧的实现
+**队友端的关机工具**（1 个）：
 
 ```python
-def _teammate_loop(self, name: str, role: str, prompt: str):
-    messages = [{"role": "user", "content": prompt}]
-
-    for _ in range(MAX_ROUNDS):
-        # 检查邮箱
-        inbox = self.bus.read_inbox(name)
-        if inbox != "[]":
-            msgs = json.loads(inbox)
-
-            # 检查关机请求
-            for msg in msgs:
-                if msg.get("type") == "shutdown_request":
-                    # LLM 决定是否同意
-                    decision_msg = messages.copy()
-                    decision_msg.append({
-                        "role": "user",
-                        "content": f"""收到关机请求：
-请求 ID: {msg['request_id']}
-原因: {msg.get('extra', {}).get('reason', '')}
-
-你当前正在进行重要工作吗？如果是，可以拒绝。
-请调用 shutdown_response 工具回复。"""
-                    })
-
-                    # 让 LLM 决策
-                    response = client.messages.create(
-                        model=MODEL,
-                        messages=decision_msg,
-                        tools=[{
-                            "name": "shutdown_response",
-                            "input_schema": {
-                                "type": "object",
-                                "properties": {
-                                    "request_id": {"type": "string"},
-                                    "approve": {"type": "boolean"},
-                                    "reason": {"type": "string"}
-                                },
-                                "required": ["request_id", "approve"]
-                            }
-                        }],
-                        max_tokens=1000
-                    )
-
-                    # 执行决策
-                    for block in response.content:
-                        if block.type == "tool_use" and block.name == "shutdown_response":
-                            handle_shutdown_response(
-                                name,
-                                block.input["request_id"],
-                                block.input["approve"],
-                                block.input.get("reason", "")
-                            )
-
-                    # 如果同意，准备退出
-                    if block.input.get("approve"):
-                        # 完成当前工作
-                        self._cleanup(name)
-                        return  # 退出循环
-
-        # 正常的 Agent 循环...
+{
+    "name": "shutdown_response",
+    "description": "Respond to a shutdown request. Approve to shut down, reject to keep working.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "request_id": {"type": "string"},
+            "approve": {"type": "boolean"},
+            "reason": {"type": "string"}
+        },
+        "required": ["request_id", "approve"]
+    }
+}
 ```
+
+注意同一个工具名 `shutdown_response` 在 Lead 和队友端有不同的实现：
+- Lead 端：查询关机请求的状态（`_check_shutdown_status`）
+- 队友端：响应关机请求，approve 或 reject（`_exec` 中的处理逻辑）
 
 ---
 
@@ -258,203 +321,204 @@ def _teammate_loop(self, name: str, role: str, prompt: str):
 
 ```
 场景：高风险操作
-Lead → Bob: "重构整个认证模块"
+Lead -> Bob: "重构整个认证模块"
 Bob [立即开始，可能破坏系统！]
 
 更好的方式：
-Lead → Bob: "重构整个认证模块"
+Lead -> Bob: "重构整个认证模块"
 Bob [先写计划]
-Bob → Lead: "这是我的重构计划..."
+Bob -> Lead: plan_approval(plan="重构计划...")
 Lead [审查计划]
-Lead → Bob: "计划批准，请执行"
-Bob [开始执行]
+Lead -> Bob: plan_approval(request_id="e5f6a1b2", approve=True, feedback="...")
+Bob [收到批准通知，开始执行]
 ```
 
-### 4.2 协议设计
+### 4.2 源码分析：队友提交计划
+
+队友的 `_exec()` 方法中处理 `plan_approval` 工具（第 246-255 行）：
 
 ```python
-plan_requests = {}
-
-def submit_plan(
-    from_member: str,
-    plan: str,
-    estimated_time: str = ""
-) -> str:
-    """提交计划"""
-    req_id = str(uuid.uuid4())[:8]
-
-    plan_requests[req_id] = {
-        "from": from_member,
-        "plan": plan,
-        "estimated_time": estimated_time,
-        "status": "pending"
-    }
-
-    # 发送给 Lead 审批
+if tool_name == "plan_approval":
+    plan_text = args.get("plan", "")
+    req_id = str(uuid.uuid4())[:8]              # UUID 前 8 位
+    with _tracker_lock:
+        plan_requests[req_id] = {
+            "from": sender,                      # 提交者名称
+            "plan": plan_text,                   # 计划内容
+            "status": "pending"                  # 初始状态
+        }
     BUS.send(
-        from_member,
-        "lead",
-        f"计划待审批：{plan[:100]}...",
-        "plan_request",
-        {"request_id": req_id, "plan": plan, "estimated_time": estimated_time}
+        sender, "lead", plan_text,               # 消息内容是计划文本
+        "plan_approval_response",                # 消息类型
+        {"request_id": req_id, "plan": plan_text} # extra 字段
     )
+    return f"Plan submitted (request_id={req_id}). Waiting for lead approval."
+```
 
-    return f"计划 {req_id} 已提交审批"
+**关键细节**：
+1. **request_id 在队友端生成**：与关机协议（Lead 端生成）不同，计划的 request_id 由提交计划的队友生成。
+2. **消息类型是 `plan_approval_response`**：虽然名字含 "response"，但这是队友发给 Lead 的请求消息。这是因为在 `VALID_MSG_TYPES` 中预定义了 `plan_approval_response` 类型，命名时采用的是"从 Lead 视角出发"的惯例——Lead 收到这条消息后需要做出审批决策，因此将队友发来的计划视为一种"待审批的响应"。源码中后续 Lead 审批通过后也复用了同一消息类型 `plan_approval_response` 发回通知，使得该类型实际上承担了双向通信的角色，命名略显反直觉。
+3. **`plan_requests` 字典记录**：包含 `from`（提交者）、`plan`（计划文本）、`status`（初始为 pending）。
 
-def review_plan(
-    request_id: str,
-    approve: bool,
-    feedback: str = ""
-) -> str:
-    """审批计划"""
-    if request_id not in plan_requests:
-        return f"未知请求 ID: {request_id}"
+### 4.3 源码分析：Lead 审批计划
 
-    req = plan_requests[request_id]
-    req["status"] = "approved" if approve else "rejected"
-    req["feedback"] = feedback
+`handle_plan_review()` 函数（第 361-372 行）处理 Lead 的审批决策：
 
-    # 通知提交者
+```python
+def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> str:
+    with _tracker_lock:
+        req = plan_requests.get(request_id)
+    if not req:
+        return f"Error: Unknown plan request_id '{request_id}'"
+    with _tracker_lock:
+        req["status"] = "approved" if approve else "rejected"
     BUS.send(
-        "lead",
-        req["from"],
-        f"你的计划已{'批准' if approve else '拒绝'}。{feedback}",
-        "plan_approval",
-        {"request_id": request_id, "approve": approve, "feedback": feedback}
+        "lead", req["from"], feedback,
+        "plan_approval_response",
+        {"request_id": request_id, "approve": approve, "feedback": feedback},
     )
+    return f"Plan {req['status']} for '{req['from']}'"
+```
 
-    return f"计划 {request_id}: {req['status']}"
+**注意锁的使用模式**：这里用了两次 `with _tracker_lock`：
+1. 第一次：读取请求（`plan_requests.get`）
+2. 第二次：更新状态（`req["status"] = ...`）
+
+两次加锁之间有一个 `if not req` 的判断。这个实现有一个微妙之处：在两次加锁之间，理论上另一个线程可能修改了 `plan_requests`（虽然在当前代码中不太可能发生）。这是为了在锁外执行错误检查，避免在锁内返回。
+
+### 4.4 计划审批的完整代码路径
+
+```
+时间线：
+  t1: Bob 的 LLM 决定提交计划，调用 plan_approval(plan="重构认证模块：...")
+
+  t2: _exec() 处理 plan_approval 工具
+      → 生成 req_id="e5f6a1b2"
+      → plan_requests["e5f6a1b2"] = {"from":"bob", "plan":"...", "status":"pending"}
+      → 发送 plan_approval_response 消息到 lead.jsonl
+
+  t3: Lead 的主循环 drain 收件箱
+      → 收到 plan_approval_response 消息（含 request_id、plan）
+      → LLM 决策：调用 plan_approval(request_id="e5f6a1b2", approve=True, feedback="计划可行")
+
+  t4: handle_plan_review() 执行
+      → plan_requests["e5f6a1b2"]["status"] = "approved"
+      → 发送 plan_approval_response 消息到 bob.jsonl（含 approve=True, feedback）
+
+  t5: Bob 的循环 drain 收件箱
+      → 收到审批结果通知
+      → LLM 看到批准，开始执行计划
 ```
 
 ---
 
 ## 5. 工具集成
 
-### 5.1 关机工具
+### 5.1 Lead 端的 12 个工具
+
+s10 在 s09 的 9 个工具基础上增加了 3 个协议工具：
 
 ```python
-TOOLS.extend([
-    {
-        "name": "request_shutdown",
-        "description": "请求队友优雅关机",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "teammate": {"type": "string"},
-                "reason": {"type": "string"}
-            },
-            "required": ["teammate"]
-        }
-    },
-    {
-        "name": "shutdown_response",
-        "description": "响应关机请求",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "request_id": {"type": "string"},
-                "approve": {"type": "boolean"},
-                "reason": {"type": "string"}
-            },
-            "required": ["request_id", "approve"]
-        }
-    },
-    {
-        "name": "check_shutdown_requests",
-        "description": "检查关机请求状态",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "request_id": {"type": "string"}
-            },
-            "required": []
-        }
-    },
-])
+TOOL_HANDLERS = {
+    # s09 继承的 9 个工具
+    "bash":              lambda **kw: _run_bash(kw["command"]),
+    "read_file":         lambda **kw: _run_read(kw["path"], kw.get("limit")),
+    "write_file":        lambda **kw: _run_write(kw["path"], kw["content"]),
+    "edit_file":         lambda **kw: _run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    "spawn_teammate":    lambda **kw: TEAM.spawn(kw["name"], kw["role"], kw["prompt"]),
+    "list_teammates":    lambda **kw: TEAM.list_all(),
+    "send_message":      lambda **kw: BUS.send("lead", kw["to"], kw["content"], kw.get("msg_type", "message")),
+    "read_inbox":        lambda **kw: json.dumps(BUS.read_inbox("lead"), indent=2),
+    "broadcast":         lambda **kw: BUS.broadcast("lead", kw["content"], TEAM.member_names()),
 
-# 计划工具
-TOOLS.extend([
-    {
-        "name": "submit_plan",
-        "description": "提交计划供审批",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "plan": {"type": "string"},
-                "estimated_time": {"type": "string"}
-            },
-            "required": ["plan"]
-        }
-    },
-    {
-        "name": "review_plan",
-        "description": "审批计划",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "request_id": {"type": "string"},
-                "approve": {"type": "boolean"},
-                "feedback": {"type": "string"}
-            },
-            "required": ["request_id", "approve"]
-        }
-    },
-])
+    # s10 新增的 3 个协议工具
+    "shutdown_request":  lambda **kw: handle_shutdown_request(kw["teammate"]),
+    "shutdown_response": lambda **kw: _check_shutdown_status(kw.get("request_id", "")),
+    "plan_approval":     lambda **kw: handle_plan_review(kw["request_id"], kw["approve"], kw.get("feedback", "")),
+}
 ```
 
-### 5.2 注册处理器
+### 5.2 队友端的 8 个工具
+
+s10 在 s09 的 6 个工具基础上增加了 2 个协议工具：
 
 ```python
-TOOL_HANDLERS.update({
-    # 关机
-    "request_shutdown": lambda **kw: handle_shutdown_request(kw["teammate"], kw.get("reason", "")),
-    "shutdown_response": lambda **kw: handle_shutdown_response(kw["sender"], kw["request_id"], kw["approve"], kw.get("reason", "")),
-    "check_shutdown_requests": lambda **kw: json.dumps(shutdown_requests, indent=2),
+# s09 继承的 6 个工具
+bash, read_file, write_file, edit_file, send_message, read_inbox
 
-    # 计划
-    "submit_plan": lambda **kw: submit_plan(kw["sender"], kw["plan"], kw.get("estimated_time", "")),
-    "review_plan": lambda **kw: review_plan(kw["request_id"], kw["approve"], kw.get("feedback", "")),
-})
+# s10 新增的 2 个协议工具
+shutdown_response    # 响应关机请求（approve/reject）
+plan_approval        # 提交计划等待审批
 ```
+
+### 5.3 工具命名的对称性
+
+注意以下对称关系：
+
+| 动作 | Lead 工具 | 队友工具 |
+|------|-----------|----------|
+| 发起关机 | `shutdown_request(teammate)` | （被动接收消息） |
+| 响应关机 | `shutdown_response(request_id)` （查询状态） | `shutdown_response(request_id, approve)` （做决策） |
+| 提交计划 | （被动接收消息） | `plan_approval(plan)` |
+| 审批计划 | `plan_approval(request_id, approve)` | （被动接收消息） |
+
+同名工具在两端有不同的语义，这是一个需要理解的设计特点。
 
 ---
 
-## 6. 完整示例
+## 6. 队友循环的变化（s09 vs s10）
 
-### 6.1 优雅关机
+s10 的 `_teammate_loop` 相比 s09 有两个关键变化：
 
+### 6.1 should_exit 标志
+
+```python
+should_exit = False
+for _ in range(50):
+    inbox = BUS.read_inbox(name)
+    for msg in inbox:
+        messages.append({"role": "user", "content": json.dumps(msg)})
+    if should_exit:                        # 新增：检查退出标志
+        break
+    # ... LLM 调用和工具执行 ...
+    for block in response.content:
+        if block.type == "tool_use":
+            # ...
+            if block.name == "shutdown_response" and block.input.get("approve"):
+                should_exit = True         # 新增：关机批准后设置标志
 ```
-Lead:
-  request_shutdown(teammate="alice", reason="项目结束")
-  → 关机请求 abc123 已发送给 alice
 
-[Alice 的循环中]
-  收到关机请求
-  思考："我当前没有重要工作，同意关机"
-  shutdown_response(request_id="abc123", approve=True, reason="好的")
-  → 发送确认，清理状态，退出
+s09 的循环没有 `should_exit`，只有自然结束（50 轮上限或 `stop_reason != "tool_use"`）。s10 增加了一个主动退出条件。
 
-Lead:
-  收到确认
-  更新配置：alice 状态 → shutdown
+### 6.2 状态区分
+
+```python
+# s09: 无条件标记为 idle
+if member and member["status"] != "shutdown":
+    member["status"] = "idle"
+
+# s10: 根据 should_exit 区分
+if member:
+    member["status"] = "shutdown" if should_exit else "idle"
 ```
 
-### 6.2 计划审批
+s10 引入了明确的 `"shutdown"` 终态，与 `"idle"` 区分。这使得 Lead 可以通过 `list_teammates()` 准确判断队友是"工作完成暂时空闲"还是"已被协议关闭"。
 
+### 6.3 system prompt 的增强
+
+```python
+# s09
+sys_prompt = f"You are '{name}', role: {role}, at {WORKDIR}. Use send_message to communicate. Complete your task."
+
+# s10
+sys_prompt = (
+    f"You are '{name}', role: {role}, at {WORKDIR}. "
+    f"Submit plans via plan_approval before major work. "
+    f"Respond to shutdown_request with shutdown_response."
+)
 ```
-Bob:
-  submit_plan(plan="重构认证模块：1. 新建 UserAuth 类 2. 迁移逻辑 3. 更新测试", estimated_time="2小时")
-  → 计划 def456 已提交审批
 
-[Lead 的收件箱]
-  收到计划请求
-  思考："这个计划合理，批准"
-  review_plan(request_id="def456", approve=True, feedback="计划详细，可以执行")
-
-[Bob 的收件箱]
-  收到批准通知
-  开始执行计划
-```
+s10 的 system prompt 明确指导队友使用协议工具，让 LLM 知道应该"重大操作前提交计划"和"收到关机请求时用 shutdown_response 回复"。
 
 ---
 
@@ -462,15 +526,85 @@ Bob:
 
 | 方面 | s09 团队 | s10 协议 |
 |------|----------|----------|
-| 通信 | 自由消息 | 结构化请求 |
-| 状态 | 无 | pending/approved/rejected |
-| 关联 | 无 | request_id |
-| 协商 | 无 | 双向确认 |
-| 适用场景 | 简单通知 | 重要决策 |
+| 通信 | 自由消息（`message` / `broadcast`） | 结构化请求（`shutdown_request` / `shutdown_response` / `plan_approval_response`） |
+| 状态跟踪 | 仅 `working` / `idle`（config.json） | 增加 `shutdown` 终态 + `shutdown_requests` / `plan_requests` 内存字典 |
+| 关联机制 | 无 | `request_id`（UUID 前 8 位） |
+| 协商 | 无 | LLM 自主决策（approve / reject） |
+| 线程安全 | 无锁（每个队友只写自己的邮箱） | `_tracker_lock` 保护全局跟踪器 |
+| 队友工具数 | 6 个 | 8 个（+shutdown_response, +plan_approval） |
+| Lead 工具数 | 9 个 | 12 个（+shutdown_request, +shutdown_response, +plan_approval） |
+| 退出机制 | 仅 daemon 线程被动终止 | 协议化优雅退出（should_exit 标志） |
 
 ---
 
-## 8. 常见问题
+## 8. 完整示例
+
+### 8.1 优雅关机
+
+```
+s10 >> 请 alice 停止工作，项目已结束
+
+Lead Agent:
+  shutdown_request(teammate="alice")
+  → Shutdown request a1b2c3d4 sent to 'alice' (status: pending)
+
+[Alice 的线程中]
+  BUS.read_inbox("alice") → 收到 shutdown_request 消息
+  消息注入对话：{"type":"shutdown_request","from":"lead","content":"Please shut down gracefully.","request_id":"a1b2c3d4",...}
+  LLM 决策："当前没有重要工作，同意关机"
+  调用 shutdown_response(request_id="a1b2c3d4", approve=True)
+  → shutdown_requests["a1b2c3d4"]["status"] = "approved"
+  → 发送确认消息到 lead.jsonl
+  → should_exit = True
+
+[Alice 的下一次循环]
+  if should_exit: break
+  member["status"] = "shutdown"
+  _save_config()
+
+Lead Agent:
+  read_inbox() → 收到 alice 的 shutdown_response 消息
+  shutdown_response(request_id="a1b2c3d4")
+  → {"target": "alice", "status": "approved"}
+
+  list_teammates()
+  → Team: default
+       alice (前端开发): shutdown
+```
+
+### 8.2 计划审批
+
+```
+s10 >> 让 bob 重构认证模块
+
+Lead Agent:
+  send_message(to="bob", content="请重构认证模块")
+  → Sent message to bob
+
+[Bob 的线程中]
+  收到消息
+  LLM 思考："这是重大变更，应先提交计划"
+  plan_approval(plan="重构认证模块：1. 新建 UserAuth 类 2. 迁移逻辑 3. 更新测试")
+  → plan_requests["e5f6a1b2"] = {"from":"bob","plan":"...","status":"pending"}
+  → 发送 plan_approval_response 消息到 lead.jsonl
+  → "Plan submitted (request_id=e5f6a1b2). Waiting for lead approval."
+
+[Lead 的收件箱]
+  read_inbox() → 收到 bob 的计划请求
+  LLM 审查："计划合理，批准"
+  plan_approval(request_id="e5f6a1b2", approve=True, feedback="计划详细，可以执行")
+  → plan_requests["e5f6a1b2"]["status"] = "approved"
+  → 发送 plan_approval_response 消息到 bob.jsonl
+  → "Plan approved for 'bob'"
+
+[Bob 的收件箱]
+  收到批准通知（含 approve=True, feedback）
+  LLM 开始执行计划
+```
+
+---
+
+## 9. 常见问题
 
 ### Q1：为什么需要 request_id？
 
@@ -478,35 +612,31 @@ Bob:
 
 ```
 无 request_id（混乱）：
-Lead → Bob: "停止"
-Lead → Bob: "继续"
+Lead -> Bob: "停止"
+Lead -> Bob: "继续"
 Bob: "哪个请求？"
 
 有 request_id（清晰）：
-Lead → Bob: {req_id: "abc", action: "stop"}
-Lead → Bob: {req_id: "def", action: "continue"}
-Bob: {req_id: "abc", response: "ok"}
+Lead -> Bob: {request_id: "a1b2c3d4", type: "shutdown_request"}
+Lead -> Bob: {request_id: "e5f6a1b2", type: "shutdown_request"}
+Bob: {request_id: "a1b2c3d4", approve: true}    ← 明确对应第一个请求
 ```
 
-### Q2：协议可以嵌套吗？
+源码中 `request_id` 通过 `str(uuid.uuid4())[:8]` 生成，8 位十六进制提供约 40 亿种唯一值。
 
-**答案**：可以，但要小心处理状态。
+### Q2：shutdown_requests 和 plan_requests 为什么用内存字典而非文件？
 
-```
-嵌套示例：
-Plan Request → Subtask 1 → Shutdown Request → Subtask 2 → Plan Response
+**答案**：因为协议状态是短暂（transient）的。一旦请求完成（approved/rejected），跟踪器中的数据就只是审计记录。如果进程重启，这些请求自然失效（队友线程也会随之终止），不需要持久化。
 
-状态跟踪需要嵌套结构：
-{
-  "abc": {
-    "type": "plan",
-    "status": "pending",
-    "sub_requests": ["def", "ghi"]
-  }
-}
-```
+团队配置 `config.json` 则需要持久化，因为它记录了队友的注册信息（name、role、status），重启后需要恢复。
 
-### Q3：如何处理超时？
+### Q3：为什么 `shutdown_response` 工具在 Lead 和队友端有不同的实现？
+
+**答案**：这是角色分离的设计。Lead 作为协调者，需要查询请求状态；队友作为执行者，需要做出决策。虽然工具名相同，但在 `TOOL_HANDLERS`（Lead 端）和 `_exec`（队友端）中注册了不同的处理逻辑。这种设计使得同一个工具名在 LLM 看来是统一的接口，但底层行为因角色而异。
+
+### Q4：如何处理超时？
+
+当前源码没有实现超时机制。但可以基于 `shutdown_requests` 字典扩展：
 
 ```python
 def check_timeouts():
@@ -519,78 +649,117 @@ def check_timeouts():
             age = now - req.get("created_at", now)
             if age > timeout:
                 req["status"] = "timeout"
-                # 通知相关方
 ```
+
+注意需要在 `handle_shutdown_request()` 中记录 `created_at` 时间戳。
+
+### Q5：协议可以嵌套吗？
+
+**答案**：理论上可以，但源码中的跟踪器是扁平字典，不支持嵌套。如果需要嵌套协议（例如：计划审批 -> 子任务关机请求），需要扩展跟踪器结构：
+
+```python
+# 嵌套示例
+plan_requests["abc"] = {
+    "type": "plan",
+    "status": "pending",
+    "sub_requests": ["def", "ghi"]  # 关联的子请求
+}
+```
+
+### Q6：两个 Agent 同时请求对方关机，会发生死锁吗？
+
+**答案**：在当前架构下不会出现这种场景，因为 s10 的关机协议只能由 Lead 发起（`handle_shutdown_request` 只在 Lead 的 `TOOL_HANDLERS` 中注册）。队友之间不能互发 `shutdown_request`。
+
+但如果将协议扩展为队友之间也可以互相请求关机，确实可能出现死锁：
+
+```
+Alice -> Bob: shutdown_request {request_id: "aaa"}  （请求 Bob 关机）
+Bob   -> Alice: shutdown_request {request_id: "bbb"}  （请求 Alice 关机）
+→ 双方都在等对方先同意，陷入死锁
+```
+
+**解决思路**：
+1. **引入优先级**：为每个 Agent 分配一个全局唯一 ID，ID 较小的一方必须先批准对方的请求（类似分布式系统中的"破坏环路等待"策略）。
+2. **超时兜底**：为每个请求设置超时时间，超时后自动 reject，打破等待链。
+3. **中心化仲裁**：所有关机请求必须经过 Lead 审批，由 Lead 决定关机顺序，从架构层面消除环形依赖的可能。
 
 ---
 
-## 9. 小结
+## 10. 小结
 
-### 9.1 核心要点
+### 10.1 核心要点
 
 | 要点 | 说明 |
 |------|------|
-| **请求-响应模式** | 通用的协商机制 |
-| **状态机** | pending → approved/rejected |
-| **request_id** | 关联请求和响应 |
-| **双向确认** | 确保通信成功 |
+| **请求-响应模式** | 通用的协商机制，一个 FSM 两种应用 |
+| **request_id** | UUID 前 8 位，关联请求和响应 |
+| **状态跟踪器** | `shutdown_requests` / `plan_requests` 内存字典，`_tracker_lock` 保护线程安全 |
+| **关机协议** | request -> response -> should_exit -> 状态迁移为 shutdown |
+| **计划审批** | plan_approval 工具 -> plan_requests 记录 -> handle_plan_review 审批 |
+| **should_exit 标志** | 队友循环的主动退出条件，s09 无此机制 |
+| **工具命名对称** | 同名工具在 Lead/队友端有不同语义 |
 
-### 9.2 协议模板
+### 10.2 协议模板
 
 ```python
-# 1. 发起请求
-request_id = generate_id()
-requests[request_id] = {"status": "pending", ...}
+# 1. 生成 request_id
+request_id = str(uuid.uuid4())[:8]
+
+# 2. 记录状态（加锁）
+with _tracker_lock:
+    tracker[request_id] = {"status": "pending", ...}
+
+# 3. 发送请求（通过 MessageBus）
 BUS.send(sender, to, content, "request_type", {"request_id": request_id})
 
-# 2. 处理请求
-request = requests[request_id]
-# 做出决定...
+# 4. 响应方处理请求，更新状态
+with _tracker_lock:
+    tracker[request_id]["status"] = "approved"  # or "rejected"
 
-# 3. 响应请求
-request["status"] = "approved"  # or "rejected"
-BUS.send(to, sender, response, "response_type", {"request_id": request_id})
+# 5. 发送响应
+BUS.send(to, sender, response, "response_type", {"request_id": request_id, ...})
 ```
 
-### 9.3 关键洞察
+### 10.3 关键洞察
 
 ```
 协议的核心价值：
-1. 结构化通信：统一的消息格式
-2. 状态跟踪：知道每个请求的状态
-3. 双向确认：双方都明确结果
-4. 可扩展性：同一模式适用于多种场景
+1. 结构化通信：标准化的请求/响应格式
+2. 状态跟踪：全局字典记录每个请求的生命周期
+3. 双向确认：请求方和响应方都明确最终结果
+4. 可扩展性：同一模式适用于关机、计划审批等多个场景
 
 设计原则：
-- 一个 FSM，多种应用
-- request_id 关联请求和响应
-- pending → approved | rejected 状态转换
-- 超时处理
+- 一个 FSM（pending -> approved | rejected），两种应用（关机、计划审批）
+- request_id 关联请求和响应，支持并发
+- _tracker_lock 确保线程安全
+- should_exit 标志实现优雅退出
+- 队友的 LLM 自主决策 approve/reject，不是硬编码逻辑
 ```
 
 ---
 
-## 10. 练习
+## 11. 练习
 
 ### 练习 1：优先级协议
 
-实现带优先级的消息协议，高优先级消息优先处理。
+实现带优先级的消息协议，高优先级消息优先处理。提示：在 `MessageBus` 中按优先级排序 inbox，或在 `_teammate_loop` 中优先处理高优先级消息。
 
 ### 练习 2：投票协议
 
-实现投票机制，多个队友对决策进行投票。
+实现投票机制，多个队友对决策进行投票。提示：扩展 `shutdown_requests` 的模式，增加 `vote_requests` 跟踪器，支持多响应方。
 
 ### 练习 3：协议超时
 
-添加超时处理，自动取消长时间未响应的请求。
+添加超时处理，自动取消长时间未响应的请求。提示：在 `handle_shutdown_request()` 中记录 `created_at`，在 Lead 的主循环中定期检查超时。
 
 ### 练习 4：协议日志
 
-记录所有协议交互到日志文件，便于审计。
+记录所有协议交互到日志文件，便于审计。提示：在 `BUS.send()` 中，当 `msg_type` 为协议类型时额外写入一个 `protocol.log` 文件。
 
 ---
 
-## 11. 下一步
+## 12. 下一步
 
 现在团队有协议了，但 Lead 仍需要手动分配任务给每个队友。能否让队友主动认领任务？
 
