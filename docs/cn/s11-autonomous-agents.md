@@ -2,8 +2,6 @@
 
 > **核心口号**：*"Agent finds work itself."*
 
-> **学习目标**：理解自主性设计，掌握空闲轮询机制，学会任务自动认领与身份重注入
-
 ---
 
 ## 学习目标
@@ -20,8 +18,8 @@
 
 | 层级 | 目标 | 检验标准 |
 |------|------|----------|
-| ⭐ 基础 | 理解自主性设计的动机 | 能解释 WORK/IDLE 循环的三个阶段及触发条件，理解 60 秒超时的意义 |
-| ⭐⭐ 进阶 | 独立配置自主团队完成实际任务 | 能设计合理的任务板（`scan_unclaimed_tasks` 三重过滤），理解 `_claim_lock` 竞态防护 |
+| ⭐ 基础 | 理解自主性设计的动机 | 能解释 WORK/IDLE 循环的三阶段及触发条件，理解 60 秒超时的意义 |
+| ⭐⭐ 进阶 | 独立配置自主团队完成实际任务 | 能设计合理的任务板（三重过滤），理解 `_claim_lock` 竞态防护 |
 | ⭐⭐⭐ 专家 | 优化自主行为策略与身份管理 | 能实现角色偏好过滤、动态超时、认领冲突检测，能评估身份重注入的启发式阈值 |
 
 ---
@@ -54,7 +52,6 @@ Lead: send(to="bob", content="请编写测试")
 Lead: send(to="alice", content="请修复 bug")
 Lead: send(to="bob", content="请审查代码")
 ...
-
 问题：Lead 需要手动分配每个任务，队友完全被动等待指令
 ```
 
@@ -65,19 +62,15 @@ Lead: spawn(name="alice", role="coder")
 Lead: spawn(name="bob", role="tester")
 
 [Alice 的空闲循环]
-  扫描 .tasks/ 目录 → 发现 task_1.json (pending, 无 owner)
-  claim_task(id=1, owner="alice") → 状态变为 in_progress
-  执行任务 → 完成
+  扫描 .tasks/ → 发现 task_1.json (pending, 无 owner)
+  claim_task(id=1, owner="alice") → 执行 → 完成
 
 [Bob 的空闲循环]
-  扫描 .tasks/ 目录 → 发现 task_2.json (pending, 无 owner)
-  claim_task(id=2, owner="bob") → 状态变为 in_progress
-  执行任务 → 完成
+  扫描 .tasks/ → 发现 task_2.json (pending, 无 owner)
+  claim_task(id=2, owner="bob") → 执行 → 完成
 
 [完成后的 Alice]
-  再次扫描 → 发现 task_3.json (pending, 无 owner)
-  自动认领并执行
-...
+  再次扫描 → 发现 task_3.json → 自动认领并执行
 ```
 
 **核心变化**：Lead 只负责创建任务和 spawn 队友，队友自己找到工作。
@@ -272,9 +265,9 @@ def claim_task(task_id: int, owner: str) -> str:
     return f"Claimed task #{task_id} for {owner}"
 ```
 
-**为什么需要锁？** 多个队友线程可能同时扫描到同一个任务。如果没有锁，两个线程可能同时写入 `task_1.json`，导致 owner 被覆盖。`_claim_lock` 保证同一时刻只有一个线程能执行认领的读-改-写操作。
+**为什么需要锁？** 多个队友线程可能同时扫描到同一个任务。`_claim_lock` 保证同一时刻只有一个线程能执行认领的读-改-写操作。
 
-**注意**：锁防止并发写入，但不防止已认领任务的覆盖——因为 `claim_task` 没有在锁内检查任务是否已被认领。如果线程 A 在锁外扫描到任务、线程 B 也扫描到同一任务，B 先获得锁并认领成功，A 随后获得锁时会直接覆盖 B 的 owner 而不做检查。这意味着"先到先得"实际上由线程调度决定，后进入锁的线程会无条件覆盖前者的认领结果。
+**注意**：锁防止并发写入，但不防止已认领任务的覆盖——`claim_task` 没有在锁内检查任务是否已被认领。如果线程 A 和 B 都扫描到同一任务，B 先获得锁并认领成功，A 随后获得锁时会直接覆盖 B 的 owner。这意味着"先到先得"实际上由线程调度决定，后进入锁的线程会无条件覆盖前者的认领结果。练习 2 提供了修复思路。
 
 ---
 
@@ -292,8 +285,8 @@ Alice 的上下文：
 [上下文压缩发生！]
 [压缩摘要：Alice 完成了登录功能]
 
-压缩后 messages 列表可能变得很短（<= 3 条），
-此时系统提示中的身份信息虽然存在，但 messages 上下文中
+压缩后 messages 可能变得很短（<= 3 条），
+系统提示中的身份信息虽然存在，但 messages 上下文中
 缺少足够的对话历史来维持身份感知。
 ```
 
@@ -325,9 +318,9 @@ def make_identity_block(name: str, role: str, team_name: str) -> dict:
     }
 ```
 
-**重注入的位置**：`messages.insert(0, ...)` 将 identity block 插入到 messages 列表的最前面（头部），紧接着插入一条 assistant 确认消息。
+**重注入位置**：`messages.insert(0, ...)` 将 identity block 插入到 messages 列表头部，紧接着插入一条 assistant 确认消息。
 
-**触发条件**：`len(messages) <= 3` —— 当对话历史很短（可能刚被压缩）时才触发。这是一种启发式判断：正常工作中的 messages 列表通常很长，如果突然变短，说明可能发生了上下文压缩。
+**触发条件**：`len(messages) <= 3` 是一种启发式判断——正常工作中 messages 列表通常有几十条，如果突然变短，最可能的原因是上下文压缩。选择 `<= 3` 是因为压缩后通常只剩 2 条消息（压缩摘要 + 确认回复），加上系统提示不计入 messages，因此 `<= 3` 正好覆盖"刚被压缩"的场景。阈值太大则误触发，太小则可能漏掉。
 
 ---
 
@@ -390,13 +383,9 @@ Lead 使用 write_file 创建任务文件：
 时间线：
 [Alice]                         [Bob]
 ├── WORK: 认领并执行 task #1    ├── WORK: 认领并执行 task #3
-├── IDLE: 5s 后发现 task #2     ├── IDLE: 扫描无新任务
-├── WORK: 执行 task #2          ├── IDLE: 继续等待...
-├── IDLE: 扫描无新任务          ├── IDLE: ...60 秒超时
-└── IDLE: ...60 秒超时          └── SHUTDOWN
-└── SHUTDOWN
-
-两个队友自主并行工作，Lead 只需创建任务
+├── IDLE: 5s 后发现 task #2     ├── IDLE: 无新任务 → 继续等待
+├── WORK: 执行 task #2          ├── IDLE: ...60 秒超时
+└── IDLE: 60 秒超时 → SHUTDOWN  └── SHUTDOWN
 ```
 
 ### 5.4 交互命令
@@ -509,61 +498,45 @@ _claim_lock = threading.Lock()     # 保护 claim_task 的读-改-写
 
 ### Q1：多个队友同时认领同一任务怎么办？
 
-源码使用 `_claim_lock`（`threading.Lock()`）来防止竞态条件。`claim_task` 函数的整个读-改-写过程在 `with _claim_lock:` 块内执行，保证同一时刻只有一个线程能修改任务文件。
+源码使用 `_claim_lock`（`threading.Lock()`）防止竞态条件。`claim_task` 的整个读-改-写过程在锁内执行（详见 3.3 节）。
 
-```python
-def claim_task(task_id: int, owner: str) -> str:
-    with _claim_lock:                              # 线程锁
-        path = TASKS_DIR / f"task_{task_id}.json"
-        task = json.loads(path.read_text())
-        task["owner"] = owner
-        task["status"] = "in_progress"
-        path.write_text(json.dumps(task, indent=2))
-    return f"Claimed task #{task_id} for {owner}"
-```
-
-但要明确：锁防止并发写入，但不防止已认领任务的覆盖——因为 `claim_task` 没有在锁内检查任务是否已被认领（例如检查 `task.get("owner")` 是否非空）。如果线程 A 在锁外扫描到任务、线程 B 也扫描到同一任务，B 先获得锁并认领成功，A 随后获得锁时会直接覆盖 B 的 owner 而不做检查。这是当前实现的简化之处，练习 2 提供了修复思路。
+但要明确：锁防止并发写入，但不防止已认领任务的覆盖——`claim_task` 没有在锁内检查 `task.get("owner")` 是否非空。如果两个线程都扫描到同一任务，后获得锁的线程会无条件覆盖前者的认领结果。练习 2 提供了修复思路。
 
 ### Q2：IDLE 阶段收件箱和任务板的优先级？
 
-收件箱优先级更高。源码中先检查 `BUS.read_inbox(name)`，如果有消息则立即恢复 WORK；只有收件箱为空时才扫描任务板。这确保紧急消息（如 shutdown_request）能被及时处理。
+收件箱优先级更高。源码先检查 `BUS.read_inbox(name)`，有消息则立即恢复 WORK；只有收件箱为空时才扫描任务板。这确保紧急消息（如 shutdown_request）能被及时处理。
 
 ### Q3：身份重注入为什么只在 messages <= 3 时触发？
 
-这是一种**启发式判断**。正常工作中的 messages 列表通常有几十条消息；如果突然降到 3 条以下，最可能的原因是上下文压缩（context compression）。此时在列表头部插入 identity block，帮助 LLM 恢复对自身角色的认知。
-
-具体来说，选择 `<= 3` 这个阈值是因为：上下文压缩发生后，messages 列表通常只剩 2 条消息——一条是压缩摘要（compression summary），另一条是对压缩的确认回复。加上系统提示本身不计入 messages，因此 `<= 3` 正好覆盖了"刚被压缩"的场景。如果阈值设得太大，会在正常工作中频繁误触发；设得太小则可能漏掉刚压缩后的情况。
+启发式判断：正常工作中 messages 有几十条，突然降到 3 条以下最可能的原因是上下文压缩。选择 `<= 3` 是因为压缩后通常只剩 2 条消息（摘要 + 确认），系统提示不计入 messages，因此 `<= 3` 正好覆盖"刚被压缩"的场景（详见 4.2 节）。
 
 ### Q4：WORK 阶段最多 50 轮，够用吗？
 
-50 轮对应 `for _ in range(50)` 的循环上限。每轮包含一次 LLM 调用和可能的多步工具执行。对于大多数任务，50 轮绰绰有余。如果用完 50 轮，循环自然退出进入 IDLE 阶段，不会报错。
+50 轮是 `for _ in range(50)` 的循环上限，每轮包含一次 LLM 调用和可能的多步工具执行。对于大多数任务绰绰有余。用完后循环自然退出进入 IDLE 阶段，不会报错。
 
 ### 队友异常行为排查
 
 **场景 1：队友认领了不适合的任务**
 
-症状：一个 `tester` 角色的队友认领了 `实现用户 API` 这样的开发任务。
+症状：`tester` 角色的队友认领了"实现用户 API"这样的开发任务。
 
-原因分析：`scan_unclaimed_tasks()` 只根据三重过滤条件（pending、无 owner、无 blockedBy）筛选任务，不考虑任务内容与队友角色的匹配度。所有队友看到的是同一个任务列表，先到先得。
+原因：`scan_unclaimed_tasks()` 只根据三重过滤条件（pending、无 owner、无 blockedBy）筛选，不考虑角色匹配度。所有队友看到同一个任务列表，先到先得。
 
-排查步骤：
-1. 用 `/tasks` 命令查看哪些任务被谁认领，检查 owner 是否与角色匹配。
-2. 查看该队友的 system prompt 是否明确描述了其职责范围——如果 prompt 只写了"你是 tester"而没有排除开发类任务，LLM 可能不会主动跳过。
-3. 解决方案：在任务的 JSON 中添加 `required_role` 字段，在 `scan_unclaimed_tasks()` 中根据队友 role 进行过滤（参见练习 3 的思路）。
+排查与解决：
+1. `/tasks` 查看 owner 是否与角色匹配
+2. 检查 system prompt 是否明确描述了职责范围
+3. 在 task JSON 中添加 `required_role` 字段，在 `scan_unclaimed_tasks()` 中按角色过滤（练习 3）
 
 **场景 2：队友在 IDLE 阶段不认领任务**
 
-症状：任务板上有多个 pending 任务，但某个队友一直处于 idle 状态，不主动认领。
+症状：任务板上有 pending 任务，但队友一直 idle 不认领。
 
-原因分析：可能有以下几种情况：
-1. 队友的 IDLE 轮询已超时（60 秒）并进入 shutdown 状态——此时该队友线程已退出，不会再扫描任务。用 `/team` 命令查看其状态是否为 shutdown。
-2. 队友恰好在上一次轮询间隙收到了一条消息，进入了 WORK 阶段但 LLM 没有选择认领任务——检查该队友的收件箱是否堆积了未处理的消息。
-3. 任务被其他队友抢先认领——在并发环境下，多个 idle 队友同时扫描到同一任务时，只有最先获得 `_claim_lock` 的队友能成功认领。
+可能原因：
+1. **已 shutdown** —— IDLE 轮询超时（60 秒）后线程退出，用 `/team` 确认状态
+2. **被消息抢占** —— 收到消息进入 WORK 阶段但 LLM 没有选择认领任务，检查收件箱
+3. **被抢先认领** —— 并发环境下只有最先获得 `_claim_lock` 的队友成功认领
 
-排查步骤：
-1. 用 `/team` 查看队友状态，如果是 `shutdown` 则需要重新 spawn。
-2. 用 `/tasks` 确认任务确实处于 pending 且无 owner。
-3. 检查 `.tasks/` 目录下对应的 `task_*.json` 文件内容，确认 status 和 owner 字段。
+排查步骤：`/team` 查状态 -> `/tasks` 确认任务 pending 且无 owner -> 检查 `task_*.json` 的 status 和 owner 字段。
 
 ---
 
@@ -576,60 +549,36 @@ def claim_task(task_id: int, owner: str) -> str:
 ```
 Lead 工作流：
   1. 从 GitHub Issues 拉取待办事项
-  2. 为每个 Issue 创建 task_*.json：
-     {
-       "id": 1,
-       "subject": "Fix: 登录页面在 Safari 下布局错乱",
-       "description": "Issue #42: Safari 下 flexbox 兼容性问题",
-       "status": "pending",
-       "owner": "",
-       "required_role": "frontend"    ← 扩展字段，可让 scan 函数做角色过滤
-     }
+  2. 为每个 Issue 创建 task_*.json（可扩展 required_role 字段）
   3. spawn 队友，团队自动运转
 
 Alice (前端) 的 IDLE 轮询：
   → 扫描任务板 → 发现 task_1 (pending, required_role=frontend)
-  → claim_task(id=1, owner="alice")
-  → WORK: 修复 Safari 布局 → 提交 → idle()
+  → claim_task(id=1) → WORK: 修复 Safari 布局 → idle()
   → IDLE: 继续扫描...
 ```
 
 ### 场景二：运维自愈系统（故障检测 → 诊断 → 修复 → 验证）
 
 ```
-Lead (运维负责人)
- ├─ Watchdog (监控 Agent)
- │   prompt: "每 30 秒检查服务健康状态，发现异常立即创建诊断任务"
- │   行为：IDLE 轮询中通过 bash 执行健康检查 → 发现故障 → 创建任务
- │
- ├─ Doctor (诊断 Agent)
- │   prompt: "认领诊断任务，分析日志，输出根因报告"
- │   行为：扫描到诊断类任务 → 认领 → 查日志 → 输出根因 → 创建修复任务
- │
- └─ Medic (修复 Agent)
-     prompt: "认领修复任务，执行预定义修复方案，修复后触发验证"
-     行为：扫描到修复类任务 → 认领 → 执行修复 → 创建验证任务
+Watchdog: 每 30 秒检查健康状态 → 发现异常 → 创建诊断任务
+Doctor:   认领诊断任务 → 查日志 → 输出根因 → 创建修复任务
+Medic:    认领修复任务 → 执行修复 → 创建验证任务
 
-自愈闭环：
-  Watchdog 检测故障 → Doctor 诊断 → Medic 修复 → Watchdog 再次验证
-  全程无需人工介入
+自愈闭环：Watchdog 检测 → Doctor 诊断 → Medic 修复 → Watchdog 验证
+全程无需人工介入
 ```
 
-### 场景三：内容生产流水线
+### 场景三：内容生产流水线（依赖链）
 
 ```
-Lead 创建任务：
-  task_1: "撰写 AI Agent 技术趋势报告" (status: pending)
-  task_2: "制作配套图表" (status: pending, blockedBy: [1])
-  task_3: "排版与校对" (status: pending, blockedBy: [1, 2])
+task_1: "撰写报告" (pending)
+task_2: "制作图表" (pending, blockedBy: [1])
+task_3: "排版校对" (pending, blockedBy: [1, 2])
 
-自主团队：
-  Writer (IDLE → 扫描 → 认领 task_1 → WORK → 完成 → idle)
-  Designer (IDLE → 扫描 → task_2 被 blockedBy 跳过 → 继续等待)
-  → task_1 完成，_clear_dependency 解锁 task_2
-  Designer (IDLE → 扫描 → 认领 task_2 → WORK → 完成 → idle)
-  → task_2 完成，_clear_dependency 解锁 task_3
-  Editor (IDLE → 扫描 → 认领 task_3 → WORK → 完成)
+Writer 认领 task_1 → 完成 → 解锁 task_2
+Designer 认领 task_2 → 完成 → 解锁 task_3
+Editor 认领 task_3 → 完成
 ```
 
 ### "被动 vs 自主"升级决策表
@@ -637,13 +586,11 @@ Lead 创建任务：
 | 评估维度 | 被动模式 (s10) | 自主模式 (s11) |
 |----------|----------------|----------------|
 | 任务来源 | Lead 逐一分配 | 队友扫描任务板自动认领 |
-| Lead 负担 | 高（每步都需要手动调度） | 低（只管创建任务） |
-| 适用规模 | 3 个以内队友、5 个以内任务 | 3+ 队友、10+ 任务 |
-| 响应速度 | 依赖 Lead 的调度频率 | 5 秒轮询，几乎实时 |
+| Lead 负担 | 高 | 低（只管创建任务） |
+| 适用规模 | 3 人以内、5 任务以内 | 3+ 人、10+ 任务 |
+| 响应速度 | 依赖 Lead 调度频率 | 5 秒轮询，近实时 |
 | 资源管理 | 队友持续占用线程 | 60 秒无工作自动释放 |
-| 一致性要求 | Lead 控制分配，无竞态 | 需要 `_claim_lock` 防竞态 |
-| 错误恢复 | Lead 重新分配即可 | 需要处理认领冲突和僵尸任务 |
-| 升级成本 | 低 | 需要设计合理的任务板和角色过滤 |
+| 一致性要求 | 无竞态 | 需 `_claim_lock` 防竞态 |
 
 ---
 
@@ -693,16 +640,14 @@ Lead 创建任务：
 
 ```
 自主性的核心价值：
-1. 自我驱动：队友主动扫描任务板寻找工作
-2. 并行执行：每个队友在独立线程中自主运行
-3. 负载均衡：任务先到先得，自然分散到空闲队友
-4. 弹性伸缩：空闲 60 秒自动退出，释放资源
+1. 自我驱动 —— 队友主动扫描任务板寻找工作
+2. 并行执行 —— 每个队友在独立线程中自主运行
+3. 负载均衡 —— 任务先到先得，自然分散到空闲队友
+4. 弹性伸缩 —— 空闲 60 秒自动退出，释放资源
 
 设计原则：
-- WORK 阶段专注执行，最多 50 轮
-- IDLE 阶段定期轮询，收件箱优先于任务板
-- 超时退出避免资源浪费
-- 身份重注入确保压缩后角色不丢失
+- WORK 专注执行（最多 50 轮），IDLE 定期轮询（收件箱优先于任务板）
+- 超时退出避免资源浪费，身份重注入确保压缩后角色不丢失
 - 线程锁保护共享状态的并发安全
 ```
 

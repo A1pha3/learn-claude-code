@@ -2,8 +2,6 @@
 
 > **核心口号**：*"隔离靠目录，协调靠任务 ID"*
 
-> **学习目标**：理解执行隔离的必要性，掌握 Git Worktree 机制，学会完整的事件流追踪。
-
 ---
 
 ## 学习目标
@@ -19,9 +17,9 @@
 
 | 层级 | 目标 | 检验标准 |
 |------|------|----------|
-| ⭐ 基础 | 理解隔离的必要性与 Worktree 概念 | 能解释共享目录冲突的根因，能描述 worktree create → run → remove 的基本流程 |
-| ⭐⭐ 进阶 | 独立实现任务-工作树绑定工作流 | 能完成完整闭环：创建任务 → 创建工作树绑定 → 隔离执行 → remove/keep，理解 EventBus 的审计价值 |
-| ⭐⭐⭐ 专家 | 设计并行执行与事件查询系统 | 能实现 `run_parallel` 多工作树并行执行、事件按类型/时间范围过滤，能评估非 Git 环境的降级方案 |
+| ⭐ 基础 | 理解隔离的必要性与 Worktree 概念 | 能解释共享目录冲突的根因，能描述 create -> run -> remove 基本流程 |
+| ⭐⭐ 进阶 | 独立实现任务-工作树绑定工作流 | 能完成完整闭环：创建任务 -> 绑定工作树 -> 隔离执行 -> remove/keep，理解 EventBus 审计价值 |
+| ⭐⭐⭐ 专家 | 设计并行执行与事件查询系统 | 能实现 `run_parallel` 多工作树并行、事件按类型/时间过滤，能评估非 Git 降级方案 |
 
 ---
 
@@ -54,25 +52,16 @@ uv run python agents/s12_worktree_task_isolation.py
 在 s11 中，多个队友自主认领任务，但所有人在同一个目录下工作：
 
 ```
-工作目录: /workspace/
-
-Alice (认领任务 #1: 修改 auth.py):
-  edit_file("auth.py", ...)
-  write_file("auth.py", modified_content)
-
-Bob (认领任务 #2: 同时修改 auth.py):
-  edit_file("auth.py", ...)
-  write_file("auth.py", other_modified_content)
-
+Alice (任务 #1: 修改 auth.py):  write_file("auth.py", modified_content)
+Bob   (任务 #2: 修改 auth.py):  write_file("auth.py", other_content)
 结果: Bob 的修改覆盖了 Alice 的修改！
 ```
 
-**问题根因**：
-
-1. **文件冲突**：多人同时修改同一文件
-2. **状态污染**：未提交的更改混在一起
-3. **难以回滚**：无法单独撤销某个任务的修改
-4. **测试干扰**：一个任务的测试影响另一个任务的运行
+**四个根因**：
+1. **文件冲突** —— 多人同时修改同一文件
+2. **状态污染** —— 未提交的更改混在一起
+3. **难以回滚** —— 无法单独撤销某个任务的修改
+4. **测试干扰** —— 一个任务的测试影响另一个任务
 
 ### 1.2 理想的隔离
 
@@ -164,17 +153,17 @@ REPO_ROOT = detect_repo_root(WORKDIR) or WORKDIR
 
 ## 3. 三大核心组件
 
-源码中 s12 的架构由三个核心类组成，各司其职：
+s12 的架构由三个核心类组成：
 
 ```
-TaskManager    ── 控制面：管理任务的生命周期
-EventBus       ── 观测面：记录所有事件的 append-only 日志
-WorktreeManager ── 执行面：管理 Git Worktree 的创建、执行、销毁
+TaskManager     ── 控制面：任务生命周期管理
+EventBus        ── 观测面：append-only 事件日志
+WorktreeManager ── 执行面：Git Worktree 的创建、执行、销毁
 ```
 
 ### 3.1 EventBus：事件总线
 
-EventBus 是一个 append-only 的事件日志，记录所有生命周期事件，提供可观测性。
+EventBus 是 append-only 事件日志，记录所有生命周期事件，提供可观测性。
 
 ```python
 class EventBus:
@@ -224,7 +213,7 @@ class EventBus:
 
 ### 3.2 TaskManager：任务管理器
 
-TaskManager 管理任务的生命周期，每个任务存储为 `.tasks/task_{id}.json` 文件。
+管理任务的生命周期，每个任务存储为 `.tasks/task_{id}.json` 文件。
 
 ```python
 class TaskManager:
@@ -261,11 +250,11 @@ class TaskManager:
 | `unbind_worktree(task_id)` | 解除工作树绑定（将 worktree 置空） |
 | `list_all()` | 列出所有任务 |
 
-`bind_worktree` 是绑定逻辑的关键：它将 `task["worktree"]` 设为工作树名称。如果任务当前状态为 `pending`，自动将其转为 `in_progress`。
+`bind_worktree` 是绑定逻辑的关键：将 `task["worktree"]` 设为工作树名称，若任务状态为 `pending` 则自动转为 `in_progress`。
 
 ### 3.3 WorktreeManager：工作树管理器
 
-WorktreeManager 是本章的核心，负责 Git Worktree 的创建、执行和销毁。
+本章核心类，负责 Git Worktree 的创建、执行和销毁。
 
 ```python
 class WorktreeManager:
@@ -311,23 +300,22 @@ def _validate_name(self, name: str):
         )
 ```
 
-工作树名称只允许 ASCII 字符（字母、数字、点、下划线、连字符），长度 1-40 字符。**不支持中文、空格或其他 Unicode 字符**。这意味着类似 `认证重构`、`task #1`、`my worktree` 这样的名称都会被拒绝：
+工作树名称只允许 ASCII 字符（字母、数字、点、下划线、连字符），长度 1-40 字符。名称会直接用作目录名和分支名（`wt/{name}`），因此不支持中文、空格、斜杠等：
 
 ```
-# 以下名称会触发 ValueError：
-"认证重构"        # 包含中文字符
-"task #1"        # 包含空格和 #
-"my worktree"    # 包含空格
-"任务_重构"       # 包含中文字符
-"tree/v1"        # 包含斜杠 /
+# 以下会触发 ValueError：
+"认证重构"       # 中文字符
+"task #1"       # 空格和 #
+"my worktree"   # 空格
+"tree/v1"       # 斜杠
 
-# 以下名称合法：
-"auth-refactor"   # 字母 + 连字符
-"task_1"          # 字母 + 下划线 + 数字
-"v2.0.fix"        # 字母 + 点 + 数字
+# 以下合法：
+"auth-refactor"  # 字母 + 连字符
+"task_1"         # 字母 + 下划线 + 数字
+"v2.0.fix"       # 字母 + 点 + 数字
 ```
 
-这一限制源于两个层面：正则表达式 `[A-Za-z0-9._-]` 只匹配 ASCII 子集；同时工作树名称会被直接用作目录名和 Git 分支名（`wt/{name}`），分支名中包含特殊字符可能导致 Git 命令失败。
+这一限制源于：正则 `[A-Za-z0-9._-]` 只匹配 ASCII 子集；名称直接用作目录名和分支名（`wt/{name}`），特殊字符可能导致 Git 命令失败。
 
 #### 3.3.2 创建工作树
 
@@ -392,11 +380,10 @@ def run(self, name: str, command: str) -> str:
 ```
 
 关键实现细节：
-- 使用 `shell=True` 执行命令，支持管道等 shell 特性
+- `shell=True` 支持管道等 shell 特性
 - `cwd=path` 确保命令在目标工作树目录中运行
-- 超时 300 秒（5 分钟）
-- 输出截断到 50000 字符
-- 内置危险命令黑名单：`rm -rf /`、`sudo`、`shutdown`、`reboot`、`> /dev/`
+- 超时 300 秒，输出截断到 50000 字符
+- 危险命令黑名单：`rm -rf /`、`sudo`、`shutdown`、`reboot`、`> /dev/`
 
 > **安全提示**：`shell=True` 存在命令注入风险。在教学代码中为了简化命令拼接而使用。在生产环境中，推荐使用参数数组方式调用命令，并对可执行命令建立白名单。
 
@@ -411,7 +398,7 @@ def keep(self, name: str) -> str:
     self.events.emit("worktree.keep", ...)
 ```
 
-`keep` 的语义：工作树保留在磁盘上，但标记为 "kept" 状态，表示任务已完成但需要保留工作成果供后续查看。
+`keep` 的语义：工作树保留在磁盘上，标记为 "kept" 状态，供后续审查。
 
 #### 3.3.5 移除工作树
 
@@ -609,71 +596,39 @@ Lead:
 
 ### Q1：不在 Git 仓库中会怎样？
 
-源码在 `WorktreeManager.__init__` 中调用 `_is_git_repo()` 检测。如果不在 Git 仓库中，`self.git_available` 为 `False`，所有后续 worktree 操作会抛出 `RuntimeError("Not in a git repository. worktree tools require git.")`。任务管理功能不受影响。
+`WorktreeManager.__init__` 中调用 `_is_git_repo()` 检测。不在 Git 仓库时，`self.git_available` 为 `False`，所有 worktree 操作抛出 `RuntimeError`。任务管理功能不受影响。
 
-**降级方案**：如果你需要在非 Git 环境中实现类似的隔离效果，可以采用"子目录方案"作为降级策略——在主工作目录下创建独立的子目录作为隔离的工作空间，手动复制所需文件到子目录中，完成后将结果复制回来。虽然缺少 Git 的分支管理和硬链接效率，但在文件级别仍能实现基本的隔离：
+**降级方案**：非 Git 环境可用"子目录方案"——在主工作目录下创建独立子目录，手动复制所需文件。缺少 Git 的分支管理和硬链接效率，但文件级别仍能隔离：
 
 ```python
-# 降级方案的简化实现思路
 def create_isolated_dir(name: str) -> str:
-    """在非 Git 环境下创建隔离目录"""
+    """降级方案：在非 Git 环境下创建隔离目录"""
     isolated_dir = Path(".workspaces") / name
     isolated_dir.mkdir(parents=True, exist_ok=True)
-    # 复制必要的源文件到隔离目录
     import shutil
     for f in Path(".").glob("*.py"):
         shutil.copy2(f, isolated_dir / f.name)
     return str(isolated_dir)
 ```
 
-不过在实际项目中，建议始终在 Git 仓库中工作，以获得完整的版本控制和 worktree 支持。
+实际项目中建议始终在 Git 仓库中工作。
 
 ### Q2：工作树有未提交的更改能移除吗？
 
-默认不能。需要传入 `force=True`，这会在 git 命令中添加 `--force` 参数：
-
-```python
-# force=False 时 git 会拒绝移除有更改的工作树
-# force=True 时传递 --force 参数
-args = ["worktree", "remove"]
-if force:
-    args.append("--force")
-args.append(wt["path"])
-self._run_git(args)
-```
+默认不能。需传入 `force=True`，这会在 git 命令中添加 `--force` 参数。
 
 ### Q3：remove 和 keep 有什么区别？
 
-- **remove**：执行 `git worktree remove` 删除磁盘上的工作树目录，索引中标记 status 为 "removed"
-- **keep**：不删除工作树，只在索引中将 status 标记为 "kept"，保留工作成果供后续审查
+- **remove** —— 执行 `git worktree remove` 删除磁盘目录，索引标记 status 为 "removed"
+- **keep** —— 不删除目录，索引标记 status 为 "kept"，保留工作成果供后续审查
 
 ### Q4：如何查看某个工作树的 Git 状态？
 
-使用 `worktree_status` 工具，它在工作树目录下执行 `git status --short --branch`：
-
-```python
-def status(self, name: str) -> str:
-    wt = self._find(name)
-    path = Path(wt["path"])
-    r = subprocess.run(
-        ["git", "status", "--short", "--branch"],
-        cwd=path,
-        ...
-    )
-    return text or "Clean worktree"
-```
+使用 `worktree_status` 工具，在工作树目录下执行 `git status --short --branch`（详见 3.3.6 节 `_run_git` 封装）。
 
 ### Q5：`shell=True` 会有安全风险吗？
 
-有风险。源码中有两层防护：
-
-1. **危险命令黑名单**：拦截 `rm -rf /`、`sudo`、`shutdown`、`reboot`、`> /dev/` 等命令
-2. **超时限制**：300 秒超时，防止长时间运行的命令
-
-但黑名单方式无法覆盖所有危险命令。在生产环境中推荐：
-- 优先使用参数数组方式调用命令
-- 对可执行命令建立白名单
-- 记录命令执行事件，便于审计
+有风险。源码有两层防护：危险命令黑名单（`rm -rf /`、`sudo`、`shutdown`、`reboot`、`> /dev/`）和 300 秒超时。但黑名单无法覆盖所有危险命令。生产环境中推荐：使用参数数组调用、建立命令白名单、记录执行事件便于审计。
 
 ---
 
@@ -681,93 +636,67 @@ def status(self, name: str) -> str:
 
 ### 场景一：微服务并行开发
 
-多个队友同时开发不同的微服务，各自拥有独立的代码分支和文件系统：
-
 ```
 Lead:
-  task_create(subject="用户服务开发")
-  task_create(subject="订单服务开发")
-  task_create(subject="支付服务开发")
-
+  task_create(subject="用户服务") / task_create(subject="订单服务") / task_create(subject="支付服务")
   worktree_create(name="user-svc", task_id=1)
   worktree_create(name="order-svc", task_id=2)
   worktree_create(name="payment-svc", task_id=3)
 
-Alice (认领任务 #1):
-  worktree_run(name="user-svc", command="vim services/user.py")
-  worktree_run(name="user-svc", command="git add -A && git commit -m 'feat: 用户服务'")
+Alice: worktree_run(name="user-svc", command="vim services/user.py") → commit
+Bob:   worktree_run(name="order-svc", command="vim services/order.py") → commit
+# 互不干扰
 
-Bob (认领任务 #2):
-  worktree_run(name="order-svc", command="vim services/order.py")
-  # Bob 的修改完全不影响 Alice 的文件系统视图
-
-三人完成后：
+完成后：
   worktree_keep(name="user-svc")     # 保留供 code review
-  worktree_remove(name="order-svc", complete_task=true)   # 直接合并并移除
-  worktree_remove(name="payment-svc", complete_task=true)
+  worktree_remove(name="order-svc", complete_task=true)
 ```
 
 ### 场景二：A/B 测试隔离
 
-对比两种实现方案，在隔离环境中分别运行基准测试：
-
 ```
-Lead:
-  task_create(subject="A/B 测试：数组排序算法")
-  task_create(subject="A 方案：快速排序")
-  task_create(subject="B 方案：归并排序")
+worktree_create(name="sort-quick", task_id=1)
+worktree_create(name="sort-merge", task_id=2)
 
-  worktree_create(name="sort-quick", task_id=2, base_ref="HEAD")
-  worktree_create(name="sort-merge", task_id=3, base_ref="HEAD")
-
-# 在两个隔离环境中分别实现和测试
 worktree_run(name="sort-quick", command="python -c 'from sort import quicksort; ...'")
 worktree_run(name="sort-merge", command="python -c 'from sort import mergesort; ...'")
 
-# 对比结果，选择更优方案保留，移除另一个
-worktree_keep(name="sort-quick")       # 胜出方案保留
-worktree_remove(name="sort-merge", force=true)  # 落选方案清理
+worktree_keep(name="sort-quick")                      # 胜出方案保留
+worktree_remove(name="sort-merge", force=true)         # 落选方案清理
 ```
 
 ### 场景三：CI 并行测试执行
 
-将测试套件拆分到多个工作树中并行执行，缩短总耗时：
-
 ```
-Lead:
-  worktree_create(name="test-unit")
-  worktree_create(name="test-integration")
-  worktree_create(name="test-e2e")
+worktree_create(name="test-unit") / worktree_create(name="test-integration") / worktree_create(name="test-e2e")
 
-  # 三个工作树并行运行不同类型的测试
-  worktree_run(name="test-unit", command="pytest tests/unit/ -v")
-  worktree_run(name="test-integration", command="pytest tests/integration/ -v")
-  worktree_run(name="test-e2e", command="pytest tests/e2e/ -v")
+worktree_run(name="test-unit", command="pytest tests/unit/ -v")
+worktree_run(name="test-integration", command="pytest tests/integration/ -v")
+worktree_run(name="test-e2e", command="pytest tests/e2e/ -v")
 
-  # 收集结果后清理
-  worktree_remove(name="test-unit", force=true)
-  worktree_remove(name="test-integration", force=true)
-  worktree_remove(name="test-e2e", force=true)
+# 收集结果后清理
+worktree_remove(name="test-unit", force=true)
+worktree_remove(name="test-integration", force=true)
+worktree_remove(name="test-e2e", force=true)
 ```
 
 ### "从共享目录到工作树"迁移指南
 
-| 当前状态 | 何时需要升级到工作树 | 迁移步骤 |
-|----------|----------------------|----------|
-| 1 个队友，串行任务 | 不需要 | 继续使用共享目录即可 |
-| 2-3 个队友，修改不同文件 | 可以暂缓 | 约定文件所有权（owner 字段）即可 |
-| 2+ 个队友，可能修改同一文件 | **应该升级** | 为每个并行任务创建独立 worktree |
-| 需要 A/B 对比实验 | **应该升级** | 两个 worktree 基于同一起点，分别修改 |
-| CI 并行测试套件 | **建议升级** | 每个测试分片一个 worktree，避免状态干扰 |
-| 需要完整审计链 | **必须升级** | EventBus 的 append-only 事件流提供完整可观测性 |
+| 当前状态 | 何时升级 | 迁移步骤 |
+|----------|----------|----------|
+| 1 个队友，串行任务 | 不需要 | 继续使用共享目录 |
+| 2-3 个队友，修改不同文件 | 可暂缓 | 约定文件所有权即可 |
+| 2+ 队友，可能修改同一文件 | **应该升级** | 为每个并行任务创建独立 worktree |
+| A/B 对比实验 | **应该升级** | 两个 worktree 基于同一起点 |
+| CI 并行测试 | **建议升级** | 每个测试分片一个 worktree |
+| 需要完整审计链 | **必须升级** | EventBus 事件流提供完整可观测性 |
 
-迁移操作清单：
-
+迁移清单：
 1. 确认项目在 Git 仓库中（`git rev-parse --show-toplevel` 成功）
-2. 将现有任务系统的 `.tasks/` 目录路径从 `WORKDIR` 改为 `REPO_ROOT`
-3. 在队友的 `claim_task` 成功后，自动调用 `worktree_create` 创建绑定的工作树
-4. 将队友的 `bash` 工具替换为 `worktree_run`，确保命令在隔离目录中执行
-5. 任务完成时调用 `worktree_remove(complete_task=true)` 清理环境
+2. `.tasks/` 路径从 `WORKDIR` 改为 `REPO_ROOT`
+3. `claim_task` 成功后自动调用 `worktree_create` 绑定
+4. 队友的 `bash` 工具替换为 `worktree_run`
+5. 任务完成时调用 `worktree_remove(complete_task=true)` 清理
 
 ---
 
@@ -807,15 +736,13 @@ worktree_keep(name="task-name")
 
 ```
 工作树隔离的核心价值：
-1. 完全隔离：独立的文件副本，互不干扰
-2. 安全操作：Git 原生支持，稳定可靠
-3. 易于回滚：分支级别的版本控制
-4. 可观测：完整的事件流追踪
+1. 完全隔离 —— 独立的文件副本，互不干扰
+2. 安全操作 —— Git 原生支持，稳定可靠
+3. 易于回滚 —— 分支级别的版本控制
+4. 可观测 —— 完整的事件流追踪
 
 设计原则：
-- 任务管理目标（控制面）
-- 工作树管理执行（执行面）
-- 通过 task ID 绑定
+- 任务管理目标（控制面），工作树管理执行（执行面），通过 task ID 绑定
 - 事件记录完整生命周期
 ```
 
@@ -860,12 +787,12 @@ worktree_keep(name="task-name")
 
 ### 下一步建议
 
-1. **阅读整合源码**：运行 `agents/s_full.py`，观察 12 章全部能力的整合运行效果。对照源码，理解各模块如何在同一个 Agent 循环中协同工作。
-2. **扩展工具系统**：尝试添加新的自定义工具（如 `web_search`、`database_query`），实践 s02 中学到的工具注册和处理器模式。
-3. **研究 MCP 协议**：Model Context Protocol（模型上下文协议）是 Anthropic 推出的标准工具协议。了解 MCP 如何让 Agent 动态发现和使用外部工具，以及它与本教程中硬编码工具列表的区别。
-4. **优化上下文策略**：结合 s05 的技能系统和 s06 的压缩策略，为你的 Agent 设计一套完整的知识管理和上下文管理方案。
-5. **实践多 Agent 协作**：使用 s09-s12 的知识，构建一个能自动分配任务、隔离执行、合并结果的多 Agent 团队。
-6. **分享改进**：将你的改进贡献给社区，或在个人项目中应用这些技术。
+1. **阅读整合源码** —— 运行 `agents/s_full.py`，观察 12 章全部能力的整合运行效果
+2. **扩展工具系统** —— 添加自定义工具（如 `web_search`、`database_query`），实践 s02 的工具注册和处理器模式
+3. **研究 MCP 协议** —— 了解 Model Context Protocol 如何让 Agent 动态发现外部工具，与硬编码工具列表对比
+4. **优化上下文策略** —— 结合 s05 技能系统和 s06 压缩策略，设计完整的知识与上下文管理方案
+5. **实践多 Agent 协作** —— 使用 s09-s12 的知识，构建自动分配、隔离执行、合并结果的多 Agent 团队
+6. **分享改进** —— 将改进贡献给社区，或在个人项目中应用
 
 ---
 

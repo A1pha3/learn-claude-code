@@ -99,15 +99,17 @@ TEAM.spawn(name="alice", role="coder", prompt="你是代码专家")
 ### 2.1 整体架构
 
 ```
+s09 新增组件（标记 ★）
+
 .team/                              主 Agent (lead)
-├── config.json                     │
-│   ├── {"team_name": "default"}    │ spawn_teammate(name="alice", ...)
+├── ★config.json                    │
+│   ├── {"team_name": "default"}    │ ★spawn_teammate(name="alice", ...)
 │   ├── {"name":"alice",            ▼
 │   │    "role":"coder",        ┌──────────┐
-│   │    "status":"idle"}       │ config   │
-│   └── {"name":"bob",...}      │ .json    │
+│   │    "status":"idle"}       │★config   │
+│   └── {"name":"bob",...}      │  .json   │
 │                               └──────────┘
-└── inbox/                           │
+└── ★inbox/                          │
     ├── lead.jsonl              spawn → 写入 config + 启动线程
     ├── alice.jsonl                 │
     └── bob.jsonl              ┌────┴────┐
@@ -119,8 +121,19 @@ TEAM.spawn(name="alice", role="coder", prompt="你是代码专家")
                           │ loop   │ │ loop   │
                           └────────┘ └────────┘
                                ↑         ↑
-                               │  JSONL  │
+                               │★JSONL   │
                                └─邮箱────┘
+
+★ MessageBus（s09 核心新组件）
+├── send(sender, to, content) → append-only 写入 JSONL
+├── read_inbox(name) → drain 模式读取 + 清空
+└── broadcast(sender, content, teammates) → 逐个 send
+
+★ TeammateManager（s09 核心新组件）
+├── spawn(name, role, prompt) → 写入 config.json + 启动 daemon 线程
+├── _teammate_loop(name, role, prompt) → 独立 agent 循环（最多 50 轮）
+├── list_all() → 读取 config.json 显示成员状态
+└── send_message / read_inbox → 代理 MessageBus 操作
 ```
 
 ### 2.2 目录结构（源码实际布局）
@@ -151,6 +164,17 @@ INBOX_DIR = TEAM_DIR / "inbox"
 ---
 
 ## 3. MessageBus 实现
+
+> **概念速查**
+>
+> | 概念 | 定义 | 源码映射 |
+> |------|------|----------|
+> | **MessageBus** | 团队通信中枢：基于 JSONL 邮箱实现 Agent 间异步消息传递 | `class MessageBus` |
+> | **JSONL mailbox** | 持久化邮箱：每个 Agent 一个 `.jsonl` 文件，append-only 写入，drain 读取 | `inbox/{name}.jsonl` |
+> | **drain semantics** | 读取后清空——`read_inbox()` 读取全部消息后立即 `write_text("")` 清空文件 | `read_inbox()` 中 read + clear |
+> | **config.json lifecycle** | 团队配置的创建→更新→恢复周期：spawn 时写入、idle 时更新、重启时读取恢复 | `_load_config()` / `_save_config()` |
+
+### 3.1 核心类（源码分析）
 
 ### 3.1 核心类（源码分析）
 
@@ -460,14 +484,27 @@ Lead                        Alice                      Bob
 
 ## 7. 与 s04 的对比
 
-| 特性 | s04 子 Agent | s09 团队 |
-|------|-------------|---------|
-| 生命周期 | 临时（用完即弃） | 持久（持续运行） |
-| 上下文 | 每次全新 | 独立累积 |
-| 通信 | 单向（父→子） | 双向（互发消息） |
-| 状态 | 无 | working / idle / shutdown |
-| 记忆 | 无 | 有（消息历史） |
-| 存储方式 | 无 | config.json + JSONL 邮箱 |
+| 特性 | s04 子 Agent | s09 团队 | 演进动机 |
+|------|-------------|---------|----------|
+| 生命周期 | 临时（用完即弃） | 持久（持续运行） | 复杂项目需要角色持续在线，频繁创建销毁开销大且丢失上下文 |
+| 上下文 | 每次全新 | 独立累积 | 多轮协作需要记住之前的讨论结果和代码风格偏好 |
+| 通信 | 单向（父→子） | 双向（互发消息） | 团队成员间需直接沟通（如后端通知前端接口就绪），不应事事通过 Lead 中转 |
+| 状态 | 无 | working / idle / shutdown | Lead 需要了解队友实时状态以分配任务，无状态则无法判断谁可用 |
+| 记忆 | 无 | 有（消息历史） | 队友处理过的问题不应重复处理，消息历史避免重复劳动 |
+| 存储方式 | 无 | config.json + JSONL 邮箱 | 持久化存储支持进程重启后恢复团队状态，JSONL append 保证写入原子性 |
+
+### 7.1 设计决策记录
+
+| 决策 | 选择 | 原因 | 替代方案 |
+|------|------|------|----------|
+| 通信介质 | JSONL 文件（append-only） | 追加写入是原子操作，并发安全，单行损坏不影响整体 | JSON 数组文件：追加需重写全部内容；内存队列：进程退出后丢失 |
+| 邮箱读取 | drain 模式（读取后清空） | 保证消息不重复处理，与 s08 的 drain_notifications 思路一致 | 保留已读标记：增加复杂度，需维护 read/unread 状态 |
+| 团队配置存储 | 单一 config.json | 成员数量有限（通常 < 10），单文件读写简单 | 每个成员独立配置文件：过度工程，增加一致性维护负担 |
+| 队友工具隔离 | 队友不含 spawn/broadcast | 防止无限递归（alice spawn bob，bob spawn charlie...） | 信任模型：允许任意 spawn，通过层级限制控制深度 |
+| 线程模型 | daemon=True 守护线程 | 与 s08 相同的理由：队友线程不应阻止用户退出 | 可中断线程：需要实现优雅关机协议（s10 会引入） |
+| 队友循环上限 | 50 轮 | 防止 token 无限消耗，50 轮足以完成大多数单次任务 | 无限制：成本失控风险；10 轮太少：复杂任务无法完成 |
+| 消息类型 | 预定义枚举 + extra 字段 | 类型安全（拒绝未知类型），extra 提供扩展灵活性 | 自由格式：缺少约束，易出错；严格 schema：过度限制 |
+| config.json 写入 | `write_text()` 全量覆盖 | 成员少、写入频率低，简单直接 | 原子重命名（write_to_tmp + os.replace）：更安全但复杂，教学场景不必要 |
 
 ---
 
@@ -609,11 +646,23 @@ Lead (安全负责人)
 
 提示：可以定义一个 `ROLE_TEMPLATES` 字典，将角色名映射到预设的 role 描述和默认 prompt 模板。在 `spawn` 方法中查找模板，如果匹配则自动填充 role 和 prompt 参数。
 
+**验收标准**：
+- 定义 `ROLE_TEMPLATES = {"coder": {...}, "tester": {...}, "reviewer": {...}}`
+- `spawn_teammate(name="alice", role="coder")` 无需指定 prompt 即可使用预设模板
+- 预设模板中的 prompt 包含具体行为指引（如 tester 的 prompt 包含"先写测试用例再执行"）
+- 自定义 prompt 优先级高于模板——`spawn_teammate(name="alice", role="coder", prompt="自定义指令")` 使用自定义版本
+
 ### 练习 2：消息确认
 
 实现消息确认机制，确保消息被接收和处理。
 
 提示：可以在 MessageBus 中添加 `confirm` 消息类型，发送方在消息中附带一个唯一 ID，接收方处理完后通过 `send` 回复一条带该 ID 的确认消息。发送方在 `read_inbox` 时检查是否收到对应的确认。
+
+**验收标准**：
+- 发送消息时自动附带 `"msg_id": str(uuid.uuid4())[:8]` 字段
+- 接收方处理消息后自动回复一条 `"type": "confirm", "original_msg_id": "..."` 消息
+- 发送方可以调用 `BUS.is_confirmed(msg_id)` 检查某条消息是否已被确认
+- 超过 30 秒未确认的消息可以通过 `BUS.get_unconfirmed(sender)` 查询
 
 ### 练习 3：队友发现
 
@@ -621,11 +670,23 @@ Lead (安全负责人)
 
 提示：可以为队友添加一个 `list_teammates` 工具，内部调用 `TEAM.list_all()` 读取 config.json 中的成员列表。注意不要暴露 spawn 等管理能力，只提供只读查询。
 
+**验收标准**：
+- 队友的工具集新增 `list_teammates` 工具
+- 队友调用 `list_teammates` 后能看到所有成员的 name、role 和 status
+- 队友无法通过此工具获取 spawn 等管理能力（只读）
+- 输出格式与 Lead 的 `list_teammates` 一致
+
 ### 练习 4：状态同步
 
 实现心跳机制，定期同步队友状态。
 
 提示：可以在 `_teammate_loop` 中每隔 N 轮调用一次 `_save_config()` 将当前状态写入 config.json，同时 Lead 端在 `list_teammates` 中对比内存状态与文件状态，检测"僵尸"队友（线程已退出但 config 中仍为 working）。
+
+**验收标准**：
+- 队友每 10 轮自动调用 `_save_config()` 更新 config.json 中的 `"last_heartbeat"` 时间戳
+- Lead 的 `list_teammates` 输出中增加心跳时间显示（如 `alice (coder): working [heartbeat: 3s ago]`）
+- Lead 检测到"僵尸队友"（config 中 status 为 working 但心跳超过 60 秒）时标记为 `[STALE]`
+- 检测到僵尸队友后自动将其状态更新为 `"idle"` 并写入 config.json
 
 ---
 

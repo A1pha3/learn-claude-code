@@ -1,6 +1,6 @@
 # s03：任务规划 -- 让 Agent 不再迷失
 
-> **核心口号**：*"没有计划的 Agent 会迷失"*
+> **核心口号**：*"写下来的计划才是计划，否则只是意图"*
 
 > **学习目标**：理解规划的重要性，实现任务清单系统，掌握状态机设计
 
@@ -45,6 +45,14 @@ uv run python agents/s03_todo_write.py
 ---
 
 ## 1. 问题的本质
+
+> **概念速查：TodoManager**
+>
+> 一个带严格校验的任务状态管理器，维护一个字典列表 `self.items`。每个条目包含 `id`、`text`、`status` 三个字段。核心约束：同时只能有一个 `in_progress` 状态的任务（单一焦点原则），条目上限 20 条。渲染后以 `[ ]` / `[>]` / `[x]` 符号展示在每轮上下文中，防止 Agent 在多步任务中迷失方向。
+
+> **概念速查：提醒机制（Reminder）**
+>
+> 当 Agent 连续 3 轮未调用 todo 工具时，系统自动在 `results` 列表头部注入 `<reminder>Update your todos.</reminder>`。提醒不重置计数器，只有实际调用 todo 工具才会重置。设计意图：以最小干预纠正 Agent 的偏离行为。
 
 ### 1.1 没有规划的 Agent 会怎样
 
@@ -127,6 +135,8 @@ uv run python agents/s03_todo_write.py
 
 **关键点**：Todo 状态通过工具结果持续注入到上下文中，确保 Agent 始终能看到计划。
 
+**为什么不把计划放在系统提示中？** 系统提示是静态的，一旦设定就不会变化。而 Todo 状态需要随着任务推进动态更新（pending -> in_progress -> completed）。将其作为工具结果注入，使得每次调用 todo 工具后，新的状态自然成为上下文的一部分。这是"动态状态"与"静态指令"在架构上的根本区别。
+
 ---
 
 ## 2. TodoManager 设计
@@ -164,7 +174,7 @@ uv run python agents/s03_todo_write.py
 
 **为什么只能有一个 in_progress？**
 
-这迫使 Agent **聚焦单一任务**，避免同时做多件事导致混乱。源码第 68-72 行实现了这一约束：
+这迫使 Agent **聚焦单一任务**，避免同时做多件事导致混乱。从 LLM 注意力机制的角度看，多个 in_progress 会分散模型的"注意力预算"，导致每个任务都做得不完整。单一焦点约束将 Agent 的行为从"并行尝试"强制转为"串行完成"。源码第 68-72 行实现了这一约束：
 
 ```python
 if status == "in_progress":
@@ -265,6 +275,19 @@ def render(self) -> str:
 ```
 
 注意格式是 `marker #id: text`（井号在 id 前面），末尾附有完成进度统计。
+
+### 2.6 设计决策记录
+
+| 决策 | 选择 | 备选方案 | 理由 |
+|------|------|----------|------|
+| 存储方式 | 内存列表 `self.items = []` | SQLite / JSON 文件 | TodoManager 是短期记忆，无需持久化；列表渲染到消息中更直接 |
+| 状态数量 | 3 个（pending / in_progress / completed） | 5 个（+ blocked / cancelled） | 3 态足以覆盖核心流程，更少的状态意味着更少的 LLM 犯错空间 |
+| 焦点约束 | 同一时刻只能有 1 个 in_progress | 允许多个 in_progress | 强制聚焦单一任务，防止 Agent 在任务间跳跃导致混乱 |
+| 条目上限 | 20 条 | 无上限 / 50 条 | 20 条约 400-1000 tokens，既够用又不至于淹没上下文；超过 20 说明应拆分子 Agent |
+| 提醒阈值 | 3 轮未调用 todo | 1 轮 / 5 轮 | 3 轮平衡了"不打断正常工作流"和"及时纠正偏离"的需求 |
+| 提醒位置 | `results.insert(0, ...)` 插入到 results 头部 | 单独追加一条 user 消息 | 保持 messages 结构规整（每轮一条 assistant + 一条 user），且确保 LLM 优先看到提醒 |
+| 校验策略 | 原子性：校验失败则整个更新被拒绝 | 逐条校验、跳过无效条目 | 原子性保证状态一致性，避免部分更新导致 todo 列表进入不一致状态 |
+| 渲染格式 | `marker #id: text` + 末尾进度统计 | 仅列表，无统计 | 进度统计（如 `1/3 completed`）帮助 LLM 感知整体进度，减少重复已完成任务的概率 |
 
 ---
 
@@ -554,14 +577,14 @@ rounds_since_todo = 0 ----> 1 ----> 2 ----> 3 ----> 4 ...
 
 ## 7. 与 s02 的对比
 
-| 方面 | s02 | s03 |
-|------|-----|-----|
-| 工具数量 | 4 | 5 (+todo) |
-| 规划能力 | 无 | TodoManager（全局单例） |
-| 状态管理 | 无 | pending / in_progress / completed |
-| 提醒机制 | 无 | 3 轮后自动注入 reminder 到 results |
-| 循环结构 | `while stop_reason == "tool_use"` | 相同 + `rounds_since_todo` 计数器 |
-| 校验能力 | 基础错误处理 | TodoManager 内建多层校验 |
+| 方面 | s02 | s03 | 为什么这样演进 |
+|------|-----|-----|----------------|
+| 工具数量 | 4 | 5 (+todo) | 多步任务需要显式规划，否则 Agent 在长对话中随机游走 |
+| 规划能力 | 无 | TodoManager（全局单例） | 工具结果是临时性的，无法持续展示计划；TodoManager 通过渲染注入提供持久可见的任务列表 |
+| 状态管理 | 无 | pending / in_progress / completed | LLM 的"工作记忆"有限，需要外部状态机替代记忆 |
+| 提醒机制 | 无 | 3 轮后自动注入 reminder 到 results | 即使有 todo 工具，Agent 也可能忘记更新；提醒是"自动化"层面的保障 |
+| 循环结构 | `while stop_reason == "tool_use"` | 相同 + `rounds_since_todo` 计数器 | 基础循环不变，仅在循环内增加偏离检测逻辑 |
+| 校验能力 | 基础错误处理 | TodoManager 内建多层校验 | 状态机如果不加约束，LLM 可能产生非法状态（如多个 in_progress），破坏聚焦原则 |
 
 ---
 

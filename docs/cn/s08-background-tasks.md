@@ -112,27 +112,38 @@ pip install 和配置文件创建并行执行
 ### 2.1 架构图
 
 ```
+s08 新增组件（标记 ★）
+
 主线程 (Agent 循环)                     后台线程 1               后台线程 2
 ┌──────────────────────┐               ┌──────────────┐        ┌──────────────┐
 │                      │               │ pip install  │        │   pytest     │
 │  user input          │               │              │        │              │
 │      ↓               │    spawn ───→ │  运行中...   │        │              │
-│  agent_loop()        │               │      ↓       │        │              │
-│      ↓               │               │  subprocess  │        │              │
-│  drain_notifications │◄── enqueue ───│  完成        │        │  运行中...   │
-│      ↓               │    (加锁)     │              │        │      ↓       │
+│  agent_loop()        │    ★daemon    │      ↓       │        │              │
+│      ↓               │    =True      │  subprocess  │        │              │
+│  ★drain_notifications│◄── enqueue ───│  完成        │        │  运行中...   │
+│      ↓               │  (★_lock保护) │              │        │      ↓       │
 │  注入 <background-   │               └──────────────┘        │  subprocess  │
 │    results> 到消息   │                                       │      ↓       │
 │      ↓               │               ┌──────────────┐        │  完成        │
-│  LLM 调用            │               │ _notification│◄── enqueue ──│       │
-│  (带新上下文)         │               │  _queue      │        │              │
+│  LLM 调用            │               │★_notification│◄── enqueue ──│       │
+│  (带新上下文)         │               │  ★_queue     │        │              │
 │      ↓               │               │  [结果1,     │        └──────────────┘
 │  执行工具...         │               │   结果2]     │
 │      ↓               │               └──────────────┘
-│  drain_notifications │── 取出并清空队列
+│  ★drain_notifications│── 取出并清空队列
 │      ↓               │
 │  LLM 调用            │
 └──────────────────────┘
+
+★ BackgroundManager（s08 核心新组件）
+├── .tasks: Dict[task_id, {status, result, command}]
+├── ._notification_queue: List[notif]   ← _lock 保护
+├── ._lock: threading.Lock
+├── run(command) → task_id + daemon 线程
+├── _execute(task_id, command) → subprocess + enqueue
+├── check(task_id) → 状态查询
+└── drain_notifications() → 取出并清空队列
 ```
 
 ### 2.2 时间线对比
@@ -153,6 +164,18 @@ Agent 空闲等待时间：同步 125s vs 异步 0s
 ---
 
 ## 3. BackgroundManager 源码分析
+
+> **概念速查**
+>
+> | 概念 | 定义 | 源码映射 |
+> |------|------|----------|
+> | **daemon thread** | 守护线程：主程序退出时自动终止，不阻塞进程退出 | `threading.Thread(daemon=True)` |
+> | **drain pattern** | "取出并清空"语义——读取队列后立即清空，保证每条通知只处理一次 | `drain_notifications()` 中 `list() + clear()` |
+> | **_notification_queue** | 完成通知缓冲区：后台线程写入（append），主线程 drain 时读取并清空 | `self._notification_queue: list` |
+> | **_lock scope** | 互斥锁的作用范围——只保护 `_notification_queue`，不保护 `self.tasks` | `with self._lock:` 仅包裹 queue 的 append 和 drain |
+> | **通知注入** | 将后台结果以 `user+assistant` 配对形式注入消息流，满足 API 交替要求 | `agent_loop` 中的 `<background-results>` 注入 |
+
+### 3.1 核心数据结构
 
 ### 3.1 核心数据结构
 
@@ -575,15 +598,15 @@ s08 层面：
 
 ### 6.3 对比表
 
-| 方面 | s07 任务系统 | s08 后台任务 |
-|------|-------------|-------------|
-| 执行方式 | Agent 决定何时推进 | 后台线程自动执行 |
-| 存储 | 文件系统（持久化） | 内存（临时性） |
-| 状态管理 | 三态（pending/in_progress/completed） | 四态（running/completed/timeout/error） |
-| 适用场景 | 逻辑任务规划和跟踪 | 耗时命令的异步执行 |
-| 通知机制 | 无（直接返回结果） | 通知队列 + drain 模式 |
-| 依赖管理 | DAG 依赖图 | 无 |
-| 核心价值 | 跨会话状态保持 | 并发执行不阻塞 |
+| 方面 | s07 任务系统 | s08 后台任务 | 演进动机 |
+|------|-------------|-------------|----------|
+| 执行方式 | Agent 决定何时推进 | 后台线程自动执行 | 慢命令（pip install、pytest）阻塞 Agent 思考，需解耦执行时间 |
+| 存储 | 文件系统（持久化） | 内存（临时性） | 后台命令结果为会话内使用，无需跨会话持久化 |
+| 状态管理 | 三态（pending/in_progress/completed） | 四态（running/completed/timeout/error） | 后台任务需区分超时和异常，逻辑任务只需正常完成 |
+| 适用场景 | 逻辑任务规划和跟踪 | 耗时命令的异步执行 | 职责分离：s07 管"做什么"，s08 管"怎么高效执行" |
+| 通知机制 | 无（直接返回结果） | 通知队列 + drain 模式 | 后台线程无法同步返回，需异步收集结果注入上下文 |
+| 依赖管理 | DAG 依赖图 | 无 | 后台命令互相独立，无需表达先后关系 |
+| 核心价值 | 跨会话状态保持 | 并发执行不阻塞 | 解决的问题完全不同，组合使用效果最强 |
 
 ---
 
@@ -767,7 +790,19 @@ background_run("watch -n 10 'curl -s http://api/health | jq .status'")
 
 ## 9. 架构总结
 
-### 9.1 核心要点
+### 9.1 设计决策记录
+
+| 决策 | 选择 | 原因 | 替代方案 |
+|------|------|------|----------|
+| 线程模型 | `daemon=True` 守护线程 | 后台命令结果为辅助性，不应阻止用户退出程序 | 非守护线程：退出时需等待所有任务完成，用户体验差 |
+| 通知投递方式 | drain 模式（主线程主动拉取） | 与 Agent 循环的 pull 模式天然契合，实现简单 | 回调/事件驱动：需要修改循环核心结构，增加复杂度 |
+| 锁保护范围 | 只保护 `_notification_queue` | `self.tasks` 利用时序保证而非锁，减少锁竞争 | 对 `self.tasks` 也加锁：增加死锁风险，性能无提升 |
+| 通知注入格式 | `user` + `assistant` 配对 | Anthropic API 要求严格的消息交替，单条 user 会导致 API 错误 | 只注入 user：后续工具结果追加时会违反交替约束 |
+| 超时阈值 | 后台 300s / 同步 120s | 后台不阻塞主循环，可容忍更长等待；同步必须快速返回 | 统一 120s：后台构建/测试场景可能不够用 |
+| 输出截断策略 | 通知 500 字符 / 完整结果 50000 字符 | 通知注入 LLM 上下文时节省 token，完整结果通过 `check()` 按需查看 | 不截断：pytest 输出可达数万字符，浪费大量 token |
+| task_id 生成 | UUID4 前 8 字符 | 4.3 亿种可能，单次会话碰撞概率极低，可读性好 | 递增整数：更简单但暴露任务数量；完整 UUID：过长不便展示 |
+
+### 9.2 核心要点
 
 | 要点 | 说明 |
 |------|------|
@@ -831,11 +866,22 @@ notifs = BG.drain_notifications()
 
 **提示**：在 `run()` 中 `acquire()`，在 `_execute()` 末尾 `release()`。
 
+**验收标准**：
+- 连续启动 6 个 `background_run` 时，第 6 个立即返回错误提示 `"Error: Too many concurrent tasks"`
+- 当某个后台任务完成后，可以成功启动新任务
+- `Semaphore` 在 `_execute()` 的 `finally` 块中 `release()`，确保异常时也能释放
+
 ### 练习 2：任务取消
 
 添加 `cancel_background` 工具，使用 `subprocess.Popen` 替代 `subprocess.run`，保留 `Popen` 对象以便调用 `terminate()`。
 
 **提示**：将 `Popen` 对象存入 `self.tasks[task_id]`，取消时调用 `proc.terminate()`。
+
+**验收标准**：
+- `background_run("sleep 60")` 后立即调用 `cancel_background(task_id="...")` 返回成功
+- 任务状态从 `running` 变为 `cancelled`
+- 被 cancel 的任务不会在后续 `drain_notifications()` 中产出完成通知
+- 对不存在的 task_id 调用 cancel 返回 `"Error: Unknown task ..."`
 
 ### 练习 3：进度跟踪
 
@@ -843,11 +889,22 @@ notifs = BG.drain_notifications()
 
 **提示**：使用 `subprocess.Popen` + `proc.stdout.readline()` 循环读取。
 
+**验收标准**：
+- 运行 `background_run("pip install numpy")` 后，`check_background()` 返回的最新输出会随安装进度更新
+- `self.tasks[task_id]` 中新增 `"progress"` 字段，存储最近 5 行 stdout
+- 任务完成后 `"progress"` 字段被完整输出替换
+
 ### 练习 4：与 s07 集成
 
 实现一个组合场景：当 s07 的某个任务被标记为 `in_progress` 时，自动使用 `background_run` 启动对应的命令。命令完成后自动将任务标记为 `completed`。
 
 **提示**：在 `task_update` 的 `in_progress` 分支中启动后台任务，在通知 drain 回调中检查是否有关联的 s07 任务。
+
+**验收标准**：
+- `task_update(task_id=1, status="in_progress", command="pytest tests/")` 自动启动后台任务
+- 后台任务完成后，下一轮 `drain_notifications()` 触发 `task_update(task_id=1, status="completed")`
+- `task_list()` 中该任务状态从 `[>]` 变为 `[x]`，无需手动操作
+- 后台任务超时时，s07 任务自动标记为 `completed` 并在 description 中记录超时信息
 
 ---
 
